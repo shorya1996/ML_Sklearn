@@ -1,0 +1,111 @@
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+# Sample Data with Potential Issues
+data = {
+    'Age': [25, 40, 35, 50, 30],
+    'Transaction_Amount': [200, 150, 180, 210, 170],
+    'Distance_from_Home': [50, 70, 60, 80, 65],
+    'Merchant_Type_Retail': [1, 0, 1, 0, 1],  # Perfectly correlated
+    'Merchant_Type_Entertainment': [0, 1, 0, 1, 0],  # Perfectly correlated with Merchant_Type_Retail
+    'Constant_Feature': [1, 1, 1, 1, 1],  # Zero variance
+    'Fraud': [1, 0, 1, 0, 1]  # Target variable
+}
+
+# Convert to DataFrame
+df = pd.DataFrame(data)
+
+# Step 1: Handle Constant Features
+print("Variance of Features:")
+print(df.var())
+
+# Drop constant features (features with zero variance)
+df = df.loc[:, df.var() != 0]
+
+# Step 2: Check Correlation for Multicollinearity
+print("\nCorrelation Matrix:")
+correlation_matrix = df.corr()
+print(correlation_matrix)
+
+# Drop one of the perfectly correlated features
+df = df.drop(columns=['Merchant_Type_Entertainment'])  # Dropping one correlated column
+
+# Step 3: Calculate VIF
+def calculate_vif(X):
+    vif_data = []
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)  # Standardize features
+    for i in range(X_scaled.shape[1]):
+        # Get R^2 for the i-th feature
+        r_squared = np.corrcoef(
+            X_scaled[:, i], 
+            X_scaled[:, [j for j in range(X_scaled.shape[1]) if j != i]].mean(axis=1)
+        )[0, 1] ** 2
+        vif = 1 / (1 - r_squared) if r_squared < 1 else np.inf
+        vif_data.append(vif)
+    return vif_data
+
+X_numeric = df.drop(columns=['Fraud', 'Merchant_Type_Retail'])  # Exclude target-like or irrelevant variables
+vif_values = calculate_vif(X_numeric)
+
+# Display VIF Results
+vif_data = pd.DataFrame({
+    "Feature": X_numeric.columns,
+    "VIF": vif_values
+})
+print("\nVariance Inflation Factor (VIF):")
+print(vif_data)
+
+# Step 4: Logistic Regression for Fraud Score
+X = df.drop(columns=['Fraud'])  # Features
+y = df['Fraud']  # Target
+
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Normalize the features using StandardScaler
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# Fit the logistic regression model
+model = LogisticRegression()
+model.fit(X_train_scaled, y_train)
+
+# Extract the coefficients from the model
+coefficients = model.coef_[0]
+print("\nOriginal Logistic Regression Coefficients:")
+print(coefficients)
+
+# Step 5: Rescale Coefficients
+sum_of_abs_coeffs = np.sum(np.abs(coefficients))
+rescaled_coefficients = coefficients / sum_of_abs_coeffs
+print("\nRescaled Coefficients:")
+print(rescaled_coefficients)
+
+# Step 6: Calculate Fraud Score
+def calculate_weighted_sum(features, rescaled_coefficients):
+    return np.dot(features, rescaled_coefficients)
+
+# Example Test Data (replace with real test data)
+test_data = np.array([25, 200, 50, 1])  # Example values
+weighted_sum = calculate_weighted_sum(test_data, rescaled_coefficients)
+
+# Normalize score to range 0-100
+min_weighted_sum, max_weighted_sum = -1, 1  # Define range based on dataset
+normalized_score = (weighted_sum - min_weighted_sum) / (max_weighted_sum - min_weighted_sum) * 100
+
+# Probability of Fraud
+probability_of_fraud = 1 / (1 + np.exp(-weighted_sum))
+
+# Display Results
+print(f"\nWeighted Sum: {weighted_sum}")
+print(f"Normalized Score (0-100): {normalized_score}")
+print(f"Probability of Fraud: {probability_of_fraud}")
+
+# Step 7: Final DataFrame After Cleaning
+print("\nFinal Cleaned DataFrame:")
+print(df)
