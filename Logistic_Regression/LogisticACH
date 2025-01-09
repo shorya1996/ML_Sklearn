@@ -1,0 +1,56 @@
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+# Sample Data with Categorical Variable
+data = {
+    'Age': [25, 40, 35, 50, 30],
+    'Transaction_Amount': [200, 150, 180, 210, 170],
+    'Distance_from_Home': [50, 70, 60, 80, 65],
+    'Merchant_Type': ['Restaurant', 'Retail', 'Restaurant', 'Entertainment', 'Retail'],
+    'Fraud': [1, 0, 1, 0, 1]  # 1 = Fraud, 0 = Non-Fraud
+}
+
+# Convert the data into a pandas DataFrame
+df = pd.DataFrame(data)
+
+# Correlation Matrix for Numerical Features
+print("Correlation Matrix for Numerical Features:")
+correlation_matrix = df[['Age', 'Transaction_Amount', 'Distance_from_Home']].corr()
+print(correlation_matrix)
+
+# Calculate VIF (Variance Inflation Factor) for Numerical Features
+print("\nVariance Inflation Factor (VIF):")
+X_numeric = df[['Age', 'Transaction_Amount', 'Distance_from_Home']]
+X_scaled = StandardScaler().fit_transform(X_numeric)
+vif_data = pd.DataFrame({
+    "Feature": X_numeric.columns,
+    "VIF": [variance_inflation_factor(X_scaled, i) for i in range(X_scaled.shape[1])]
+})
+print(vif_data)
+
+# One-hot encoding for categorical variables (Merchant_Type)
+X_categorical = pd.get_dummies(df['Merchant_Type'], drop_first=True)
+
+# Compute Cramér's V for Categorical Variables
+def cramers_v(confusion_matrix):
+    chi2 = chi2_contingency(confusion_matrix)[0]
+    n = confusion_matrix.sum().sum()
+    phi2 = chi2 / n
+    r, k = confusion_matrix.shape
+    phi2corr = max(0, phi2 - ((k - 1) * (r - 1)) / (n - 1))
+    rcorr = r - ((r - 1)**2) / (n - 1)
+    kcorr = k - ((k - 1)**2) / (n - 1)
+    return np.sqrt(phi2corr / min((kcorr - 1), (rcorr - 1)))
+
+print("\nCramér's V for Categorical Features:")
+confusion_matrix = pd.crosstab(df['Merchant_Type'], df['Merchant_Type'])
+print(f"Cramér's V: {cramers_v(confusion_matrix)}")
+
+# Combine One-hot Encoded Categorical Features with Numerical Features
+X_combined = pd.concat([X_numeric, X_categorical], axis=1)
+
+# Logistic Regression Model Workflow Continues Here...
