@@ -1,0 +1,59 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import chi2_contingency
+
+# Sample Data with Categorical Variable
+data = {
+    'Age': [25, 40, 35, 50, 30],
+    'Transaction_Amount': [200, 150, 180, 210, 170],
+    'Distance_from_Home': [50, 70, 60, 80, 65],
+    'Merchant_Type': ['Restaurant', 'Retail', 'Restaurant', 'Entertainment', 'Retail'],
+    'Fraud': [1, 0, 1, 0, 1]  # 1 = Fraud, 0 = Non-Fraud
+}
+
+# Convert the data into a pandas DataFrame
+df = pd.DataFrame(data)
+
+# Correlation Matrix for Numerical Features
+print("Correlation Matrix for Numerical Features:")
+correlation_matrix = df[['Age', 'Transaction_Amount', 'Distance_from_Home']].corr()
+print(correlation_matrix)
+
+# Manually Calculate VIF for Numerical Features
+def calculate_vif(X):
+    X = StandardScaler().fit_transform(X)  # Standardize features
+    vif = []
+    for i in range(X.shape[1]):
+        r_squared = np.corrcoef(X[:, i], X[:, [j for j in range(X.shape[1]) if j != i]].mean(axis=1))[0, 1] ** 2
+        vif.append(1 / (1 - r_squared))
+    return vif
+
+print("\nVariance Inflation Factor (VIF):")
+X_numeric = df[['Age', 'Transaction_Amount', 'Distance_from_Home']]
+vif_values = calculate_vif(X_numeric)
+vif_data = pd.DataFrame({
+    "Feature": X_numeric.columns,
+    "VIF": vif_values
+})
+print(vif_data)
+
+# One-hot encoding for categorical variables (Merchant_Type)
+X_categorical = pd.get_dummies(df['Merchant_Type'], drop_first=True)
+
+# Compute Cramér's V for Categorical Variables
+def cramers_v(confusion_matrix):
+    chi2 = chi2_contingency(confusion_matrix)[0]
+    n = confusion_matrix.sum().sum()
+    phi2 = chi2 / n
+    r, k = confusion_matrix.shape
+    return np.sqrt(phi2 / min(k - 1, r - 1))
+
+print("\nCramér's V for Categorical Features:")
+confusion_matrix = pd.crosstab(df['Merchant_Type'], df['Merchant_Type'])
+print(f"Cramér's V: {cramers_v(confusion_matrix)}")
+
+# Combine One-hot Encoded Categorical Features with Numerical Features
+X_combined = pd.concat([X_numeric, X_categorical], axis=1)
+
+# Normal Workflow Continues Here...
