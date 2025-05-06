@@ -1,0 +1,91 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from scipy.stats import linregress
+
+# 1. Fractal + Behavioral Signal Generator
+def build_fraud_signals(df, box_sizes=[0.1, 0.05, 0.01]):
+    results = []
+
+    for party_id, group in df.groupby('partyid'):
+        group = group.sort_values('transferdate')
+        group['time_gap'] = group['transferdate'].diff().dt.total_seconds().fillna(0)
+        group['log_amount'] = np.log(group['transfer_amount'] + 1)
+
+        # Normalize for fractal
+        scaler = MinMaxScaler()
+        normalized = scaler.fit_transform(group[['time_gap', 'log_amount']])
+        group[['x', 'y']] = normalized
+
+        # Fractal dimension via box counting
+        box_counts = []
+        for box_size in box_sizes:
+            boxes = set()
+            for _, row in group.iterrows():
+                ix = int(np.floor(row['x'] / box_size))
+                iy = int(np.floor(row['y'] / box_size))
+                boxes.add((ix, iy))
+            box_counts.append(len(boxes))
+
+        log_box_sizes = np.log(1 / np.array(box_sizes))
+        log_counts = np.log(box_counts)
+        slope, _, _, _, _ = linregress(log_box_sizes, log_counts)
+        fractal_dimension = slope
+
+        # Behavioral signals
+        avg_gap = group['time_gap'].mean()
+        bank_div = group['bankname'].nunique()
+        utilization = (group['transfer_amount'] / group['credit_limit']).mean()
+        variability = group['transfer_amount'].std()
+
+        results.append({
+            'partyid': party_id,
+            'fractal_dimension': fractal_dimension,
+            'avg_time_gap': avg_gap,
+            'bank_diversity': bank_div,
+            'limit_utilization_mean': utilization,
+            'transfer_variability': variability
+        })
+
+    return pd.DataFrame(results)
+
+# 2. Flag Risky Transactions
+def flag_risky_transactions(transactions):
+    # Generate party-level signals
+    signals = build_fraud_signals(transactions)
+
+    # Merge back
+    df = transactions.merge(signals, on='partyid', how='left')
+
+    # Risk conditions
+    df['reason_fractal'] = df['fractal_dimension'] > 1.8
+    df['reason_gap'] = df['avg_time_gap'] < 300
+    df['reason_bankdiv'] = df['bank_diversity'] > 5
+    df['reason_utilization'] = df['limit_utilization_mean'] > 0.8
+    df['reason_variability'] = df['transfer_variability'] > 10000
+
+    # Risk score (weights can be adjusted)
+    df['risk_score'] = (
+        df['reason_fractal'].astype(int) * 2 +
+        df['reason_gap'].astype(int) * 1 +
+        df['reason_bankdiv'].astype(int) * 2 +
+        df['reason_utilization'].astype(int) * 1 +
+        df['reason_variability'].astype(int) * 1
+    )
+
+    # Final flag
+    df['risk_flag'] = (df['risk_score'] >= 3).astype(int)
+
+    # Reason logging
+    def reason_explainer(row):
+        reasons = []
+        if row['reason_fractal']: reasons.append('High fractal dimension')
+        if row['reason_gap']: reasons.append('Short time gaps')
+        if row['reason_bankdiv']: reasons.append('Many banks used')
+        if row['reason_utilization']: reasons.append('High limit utilization')
+        if row['reason_variability']: reasons.append('High transfer variability')
+        return '; '.join(reasons)
+
+    df['risk_reason'] = df.apply(reason_explainer, axis=1)
+
+    return df[['partyid', 'transferdate', 'transfer_amount', 'risk_score', 'risk_flag', 'risk_reason']]
