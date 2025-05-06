@@ -3,7 +3,7 @@ import numpy as np
 from scipy.spatial.distance import pdist
 from datetime import timedelta
 
-# Sample ACH data (replace with your actual data)
+# Sample data (replace with actual)
 data = {
     'partyid': ['A', 'A', 'A', 'B', 'B', 'C', 'C', 'C'],
     'transferdate': pd.to_datetime(['2025-04-01', '2025-04-10', '2025-05-01',
@@ -17,20 +17,27 @@ df = pd.DataFrame(data)
 
 # Parameters
 LOOKBACK_DAYS = 30
-RISK_THRESHOLD = 0.995  # Top 0.5% parties flagged
+RISK_THRESHOLD = 0.995  # Top 0.5% risky parties
 
-# Step 1: Filter for recent transactions
-cutoff_date = df['transferdate'].max() - timedelta(days=LOOKBACK_DAYS)
-df_recent = df[df['transferdate'] >= cutoff_date]
+# Step 1: Filter per-party recent transactions
+def filter_recent_per_party(df, lookback_days):
+    result = []
+    for partyid, group in df.groupby('partyid'):
+        max_date = group['transferdate'].max()
+        cutoff = max_date - timedelta(days=lookback_days)
+        result.append(group[group['transferdate'] >= cutoff])
+    return pd.concat(result)
 
-# Step 2: Fractal-based risk scoring per partyid
+df_recent = filter_recent_per_party(df, LOOKBACK_DAYS)
+
+# Step 2: Build risk signals including fractal dimension
 def build_fraud_signals(df):
     party_signals = []
 
     for partyid, group in df.groupby('partyid'):
         group = group.sort_values(by='transferdate')
 
-        # Signal 1: Fractal Dimension of transfer amounts
+        # Fractal dimension on transfer amount
         values = group['transferamount'].values.reshape(-1, 1)
         if len(values) >= 2:
             distances = pdist(values, metric='euclidean')
@@ -48,18 +55,18 @@ def build_fraud_signals(df):
         else:
             fractal_dim = 0.0
 
-        # Signal 2: Std Dev of time gaps
-        dates = group['transferdate'].sort_values()
+        # Time gap variability
+        dates = group['transferdate']
         if len(dates) >= 2:
             time_gaps = (dates - dates.shift(1)).dt.days.dropna()
             gap_std = time_gaps.std()
         else:
             gap_std = 0
 
-        # Signal 3: Bank diversity
+        # Bank diversity
         bank_diversity = group['bankname'].nunique()
 
-        # Combined risk score
+        # Combined score
         score = fractal_dim + 0.1 * gap_std + 0.2 * bank_diversity
 
         party_signals.append({
@@ -68,21 +75,21 @@ def build_fraud_signals(df):
             'gap_std': gap_std,
             'bank_diversity': bank_diversity,
             'risk_score': score,
-            'last_risky_date': group['transferdate'].max()
+            'last_txn_date': group['transferdate'].max()
         })
 
     return pd.DataFrame(party_signals)
 
 party_signals = build_fraud_signals(df_recent)
 
-# Step 3: Risk ranking
+# Step 3: Risk flag based on top X% scores
 party_signals['risk_percentile'] = party_signals['risk_score'].rank(pct=True)
 party_signals['risk_flag'] = (party_signals['risk_percentile'] >= RISK_THRESHOLD).astype(int)
 
-# Step 4: Merge signals with full dataset
+# Step 4: Merge back and calculate active flag
 df = df.merge(party_signals, on='partyid', how='left')
-df['days_since_last_risk'] = (df['transferdate'].max() - df['last_risky_date']).dt.days
-df['active_flag'] = ((df['days_since_last_risk'] <= LOOKBACK_DAYS) & (df['risk_flag'] == 1)).astype(int)
+df['days_since_last_txn'] = (df['transferdate'].max() - df['last_txn_date']).dt.days
+df['active_flag'] = ((df['risk_flag'] == 1) & (df['days_since_last_txn'] <= LOOKBACK_DAYS)).astype(int)
 
-# Final output
+# Final result
 print(df[['partyid', 'transferdate', 'transferamount', 'risk_score', 'risk_flag', 'active_flag']])
