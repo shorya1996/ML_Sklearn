@@ -1,95 +1,92 @@
 import pandas as pd
 import numpy as np
-from scipy.spatial.distance import pdist
-from datetime import timedelta
+from sklearn.preprocessing import MinMaxScaler
+from scipy.stats import linregress
 
-# Sample data (replace with actual)
-data = {
-    'partyid': ['A', 'A', 'A', 'B', 'B', 'C', 'C', 'C'],
-    'transferdate': pd.to_datetime(['2025-04-01', '2025-04-10', '2025-05-01',
-                                    '2025-04-02', '2025-04-05', '2025-04-01',
-                                    '2025-04-03', '2025-05-01']),
-    'transferamount': [1000, 1050, 30000, 500, 600, 200, 250, 8000],
-    'bankname': ['X', 'X', 'Y', 'Z', 'Z', 'X', 'X', 'Y'],
-    'creditlimit': [10000, 10000, 10000, 5000, 5000, 2000, 2000, 2000]
-}
-df = pd.DataFrame(data)
+# Combined signal generation with rolling lookback
+def build_fraud_signals_with_lookback(df, lookback_days=30, box_sizes=[0.1, 0.05, 0.01]):
+    df['transferdate'] = pd.to_datetime(df['transferdate'])
+    results = []
 
-# Parameters
-LOOKBACK_DAYS = 30
-RISK_THRESHOLD = 0.995  # Top 0.5% risky parties
-
-# Step 1: Filter per-party recent transactions
-def filter_recent_per_party(df, lookback_days):
-    result = []
-    for partyid, group in df.groupby('partyid'):
+    for party_id, group in df.groupby('partyid'):
         max_date = group['transferdate'].max()
-        cutoff = max_date - timedelta(days=lookback_days)
-        result.append(group[group['transferdate'] >= cutoff])
-    return pd.concat(result)
+        cutoff = max_date - pd.Timedelta(days=lookback_days)
+        recent_txns = group[group['transferdate'] >= cutoff].sort_values('transferdate')
 
-df_recent = filter_recent_per_party(df, LOOKBACK_DAYS)
+        if len(recent_txns) < 3:
+            continue  # Skip if not enough data
 
-# Step 2: Build risk signals including fractal dimension
-def build_fraud_signals(df):
-    party_signals = []
+        recent_txns['time_gap'] = recent_txns['transferdate'].diff().dt.total_seconds().fillna(0)
+        recent_txns['log_amount'] = np.log1p(recent_txns['transfer_amount'])
 
-    for partyid, group in df.groupby('partyid'):
-        group = group.sort_values(by='transferdate')
+        scaler = MinMaxScaler()
+        normalized = scaler.fit_transform(recent_txns[['time_gap', 'log_amount']])
+        recent_txns[['x', 'y']] = normalized
 
-        # Fractal dimension on transfer amount
-        values = group['transferamount'].values.reshape(-1, 1)
-        if len(values) >= 2:
-            distances = pdist(values, metric='euclidean')
-            if np.all(distances == 0):
-                fractal_dim = 0.0
-            else:
-                epsilons = np.linspace(1, np.max(distances), num=10)
-                box_counts = [np.sum(distances >= eps) for eps in epsilons]
-                logs = [(np.log(1/eps), np.log(N)) for eps, N in zip(epsilons, box_counts) if N > 0]
-                if len(logs) >= 2:
-                    x, y = zip(*logs)
-                    fractal_dim = np.polyfit(x, y, 1)[0]
-                else:
-                    fractal_dim = 0.0
-        else:
-            fractal_dim = 0.0
+        box_counts = []
+        for box_size in box_sizes:
+            boxes = set()
+            for _, row in recent_txns.iterrows():
+                ix = int(np.floor(row['x'] / box_size))
+                iy = int(np.floor(row['y'] / box_size))
+                boxes.add((ix, iy))
+            box_counts.append(len(boxes))
 
-        # Time gap variability
-        dates = group['transferdate']
-        if len(dates) >= 2:
-            time_gaps = (dates - dates.shift(1)).dt.days.dropna()
-            gap_std = time_gaps.std()
-        else:
-            gap_std = 0
+        log_box_sizes = np.log(1 / np.array(box_sizes))
+        log_counts = np.log(box_counts)
+        slope, _, _, _, _ = linregress(log_box_sizes, log_counts)
+        fractal_dimension = slope
 
-        # Bank diversity
-        bank_diversity = group['bankname'].nunique()
+        avg_gap = recent_txns['time_gap'].mean()
+        bank_div = recent_txns['bankname'].nunique()
+        utilization = (recent_txns['transfer_amount'] / recent_txns['credit_limit']).mean()
+        variability = recent_txns['transfer_amount'].std()
 
-        # Combined score
-        score = fractal_dim + 0.1 * gap_std + 0.2 * bank_diversity
-
-        party_signals.append({
-            'partyid': partyid,
-            'fractal_dim': fractal_dim,
-            'gap_std': gap_std,
-            'bank_diversity': bank_diversity,
-            'risk_score': score,
-            'last_txn_date': group['transferdate'].max()
+        results.append({
+            'partyid': party_id,
+            'fractal_dimension': fractal_dimension,
+            'avg_time_gap': avg_gap,
+            'bank_diversity': bank_div,
+            'limit_utilization_mean': utilization,
+            'transfer_variability': variability,
+            'lookback_cutoff': cutoff
         })
 
-    return pd.DataFrame(party_signals)
+    return pd.DataFrame(results)
 
-party_signals = build_fraud_signals(df_recent)
+# Final scoring and flagging
+def flag_risky_transactions_dynamic(df, lookback_days=30):
+    signals = build_fraud_signals_with_lookback(df, lookback_days)
+    df = df.merge(signals, on='partyid', how='left')
 
-# Step 3: Risk flag based on top X% scores
-party_signals['risk_percentile'] = party_signals['risk_score'].rank(pct=True)
-party_signals['risk_flag'] = (party_signals['risk_percentile'] >= RISK_THRESHOLD).astype(int)
+    # Risk logic
+    df['reason_fractal'] = df['fractal_dimension'] > 1.8
+    df['reason_gap'] = df['avg_time_gap'] < 300
+    df['reason_bankdiv'] = df['bank_diversity'] > 5
+    df['reason_utilization'] = df['limit_utilization_mean'] > 0.8
+    df['reason_variability'] = df['transfer_variability'] > 10000
 
-# Step 4: Merge back and calculate active flag
-df = df.merge(party_signals, on='partyid', how='left')
-df['days_since_last_txn'] = (df['transferdate'].max() - df['last_txn_date']).dt.days
-df['active_flag'] = ((df['risk_flag'] == 1) & (df['days_since_last_txn'] <= LOOKBACK_DAYS)).astype(int)
+    df['risk_score'] = (
+        df['reason_fractal'].astype(int) * 2 +
+        df['reason_gap'].astype(int) * 1 +
+        df['reason_bankdiv'].astype(int) * 2 +
+        df['reason_utilization'].astype(int) * 1 +
+        df['reason_variability'].astype(int) * 1
+    )
 
-# Final result
-print(df[['partyid', 'transferdate', 'transferamount', 'risk_score', 'risk_flag', 'active_flag']])
+    df['risk_flag'] = (
+        (df['risk_score'] >= 3) &
+        (df['transferdate'] >= df['lookback_cutoff'])
+    ).astype(int)
+
+    def reason_explainer(row):
+        reasons = []
+        if row['reason_fractal']: reasons.append('High fractal dimension')
+        if row['reason_gap']: reasons.append('Short time gaps')
+        if row['reason_bankdiv']: reasons.append('Many banks used')
+        if row['reason_utilization']: reasons.append('High limit utilization')
+        if row['reason_variability']: reasons.append('High transfer variability')
+        return '; '.join(reasons)
+
+    df['risk_reason'] = df.apply(reason_explainer, axis=1)
+    return df[['partyid', 'transferdate', 'transfer_amount', 'risk_score', 'risk_flag', 'risk_reason']]
