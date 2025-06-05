@@ -1,0 +1,33 @@
+# src/extract_digits.py
+
+import json
+import cv2
+import os
+
+def extract_account_number_region(image_path, json_path, save_path='data/cropped_digits/'):
+    os.makedirs(save_path, exist_ok=True)
+
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    img = cv2.imread(image_path)
+    base_filename = os.path.splitext(os.path.basename(image_path))[0]
+
+    for i, obj in enumerate(data['instances']):
+        if obj['className'].lower() == 'accno':
+            points = obj['points']
+            x1, y1 = int(points[0]['x']), int(points[0]['y'])
+            x2, y2 = int(points[1]['x']), int(points[1]['y'])
+
+            crop = img[y1:y2, x1:x2]
+            cropped_file = os.path.join(save_path, f'{base_filename}_accno.png')
+            cv2.imwrite(cropped_file, crop)
+            print(f'Cropped account number saved to: {cropped_file}')
+            return cropped_file
+
+    raise ValueError("No 'AccNo' class found in annotation.")
+
+if __name__ == "__main__":
+    img_path = 'data/images/Cheque_083657.png'
+    json_path = 'data/json/Cheque_083657.json'
+    extract_account_number_region(img_path, json_path)
