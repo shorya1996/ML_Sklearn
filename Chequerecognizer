@@ -23,7 +23,7 @@ def init_db():
                         filename TEXT, 
                         field TEXT, 
                         prediction TEXT,
-                        accuracy_metrics TEXT)''')
+                        accuracy_metrics TEXT DEFAULT '{}')''')
         conn.commit()
 
 def hash_password(password):
@@ -54,7 +54,7 @@ def save_prediction(username, filename, field, prediction, accuracy_metrics):
         c.execute("""
             INSERT INTO user_data(username, filename, field, prediction, accuracy_metrics)
             VALUES (?, ?, ?, ?, ?)""",
-            (username, filename, field, prediction, json.dumps(accuracy_metrics)))
+            (username, filename, field, prediction, json.dumps(accuracy_metrics) if accuracy_metrics else '{}'))
         conn.commit()
 
 def is_admin_user(username):
@@ -77,8 +77,7 @@ def predict_digits(cropped_img, model):
     digits = []
     img = cropped_img.convert("L")
     width, height = img.size
-    # Split evenly assuming monospace digits
-    step = width // 6  # Assuming 6 digits; adjust if needed
+    step = width // 6  # Assuming 6 digits
     for i in range(6):
         digit_img = img.crop((i * step, 0, (i + 1) * step, height))
         arr = preprocess_digit(digit_img)
@@ -105,7 +104,7 @@ def login_ui():
             if login_user(username, hash_password(password)):
                 st.session_state.user = username
                 st.success("Logged in!")
-                st.rerun()
+                st.experimental_rerun()
             else:
                 st.error("Invalid credentials")
 
@@ -155,7 +154,7 @@ if uploaded_img and uploaded_json:
                     cropped = img.crop((x1, y1, x2, y2))
                     pred = predict_digits(cropped, model)
 
-                    ground_truth = inst.get("ground_truth", "")  # Use key if exists
+                    ground_truth = inst.get("ground_truth", "")
                     accuracy = {}
                     if show_accuracy and ground_truth:
                         match_percent = difflib.SequenceMatcher(None, pred, ground_truth).ratio() * 100
@@ -189,4 +188,4 @@ if is_admin_user(st.session_state.user):
 # ------------------------- LOGOUT -------------------------
 if st.button("🚪 Logout"):
     st.session_state.user = None
-    st.rerun()
+    st.experimental_rerun()
