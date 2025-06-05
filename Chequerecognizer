@@ -1,3 +1,5 @@
+# Full Streamlit Cheque App: Auth, SQLite DB, Admin, Styling
+
 import streamlit as st
 import sqlite3
 import hashlib
@@ -8,7 +10,6 @@ import numpy as np
 from tensorflow.keras.models import load_model
 from PIL import Image
 import tempfile
-import difflib
 import Levenshtein
 
 # --- DB Setup ---
@@ -33,8 +34,9 @@ def get_user_role(username):
     result = c.fetchone()
     return result[0] if result else 0
 
-def save_user_file_data(username, filename, field, prediction, accuracy_metrics):
-    c.execute('INSERT INTO user_data(username, filename, field, prediction, accuracy_metrics) VALUES (?, ?, ?, ?, ?)', (username, filename, field, prediction, json.dumps(accuracy_metrics)))
+def save_user_file_data(username, filename, field, prediction, accuracy_metrics=None):
+    c.execute('INSERT INTO user_data(username, filename, field, prediction, accuracy_metrics) VALUES (?, ?, ?, ?, ?)',
+              (username, filename, field, prediction, json.dumps(accuracy_metrics) if accuracy_metrics else '{}'))
     conn.commit()
 
 def get_user_files(username):
@@ -174,12 +176,13 @@ elif choice == "App" and st.session_state.auth:
                 st.markdown(f"**{cls} Prediction:** `{pred}`")
 
                 accuracy = {}
-                ground_truth = inst.get("ground_truth", "")
-                if show_accuracy and ground_truth:
-                    match_percent = difflib.SequenceMatcher(None, pred, ground_truth).ratio() * 100
-                    lev = Levenshtein.distance(pred, ground_truth)
-                    accuracy = {"match_percent": round(match_percent, 2), "levenshtein_distance": lev, "ground_truth": ground_truth}
-                    st.json(accuracy)
+                if show_accuracy:
+                    gt = st.text_input(f"Enter ground truth for {cls}:", key=f"gt_{cls}_{x1}_{y1}")
+                    if gt:
+                        lev = Levenshtein.distance(pred, gt)
+                        match_percent = round(100 * (1 - lev / max(len(gt), 1)), 2)
+                        accuracy = {"levenshtein": lev, "match_percent": match_percent}
+                        st.json(accuracy)
 
                 save_user_file_data(st.session_state.auth, img_file.name, cls, pred, accuracy)
 
@@ -199,6 +202,16 @@ elif choice == "App" and st.session_state.auth:
         st.markdown(f"📁 **{fname}** — 🏷️ **{field}** → 🔢 `{preds}`")
 
 
-✅ I've added evaluation metrics (Levenshtein distance, match percent) to your existing code. These metrics are conditionally calculated when the "Show Accuracy Metrics" checkbox is checked and stored as a JSON blob in the accuracy_metrics field of the user_data table.
+✅ Done. Now, when "Show Accuracy Metrics" is checked:
 
-Let me know if you'd like to add filtering or viewing of these metrics later.
+1. A text input appears for the user to enter ground truth for each field.
+
+
+2. Levenshtein distance and match percentage are calculated and shown.
+
+
+3. These metrics are stored as a JSON blob in the accuracy_metrics field in the user_data table.
+
+
+
+Let me know if you want to display saved accuracy history or further enhance it.
