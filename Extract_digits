@@ -28,19 +28,26 @@ def compute_metrics(pred, actual):
     return char_accuracy, edit_distance, exact_match
 
 # ------------------ Preprocessing -------------------
-def preprocess_digit(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
+def preprocess_digit(digit_img):
+    gray = cv2.cvtColor(digit_img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     digit_imgs = []
 
     for cnt in sorted(contours, key=lambda c: cv2.boundingRect(c)[0]):
         x, y, w, h = cv2.boundingRect(cnt)
-        if h > 10 and w > 5:
+        if h > 15 and w > 5:
             digit = thresh[y:y+h, x:x+w]
-            digit = cv2.resize(digit, (28, 28), interpolation=cv2.INTER_AREA)
-            digit = digit.astype("float32") / 255.0
-            digit_imgs.append(digit.reshape(28, 28, 1))
+            size = max(h, w)
+            square = np.zeros((size, size), dtype=np.uint8)
+            if h > w:
+                pad = (h - w) // 2
+                square[:, pad:pad+w] = digit
+            else:
+                pad = (w - h) // 2
+                square[pad:pad+h, :] = digit
+            resized = cv2.resize(square, (28, 28))
+            digit_imgs.append(resized.astype("float32") / 255.0)
 
     return digit_imgs
 
@@ -48,7 +55,8 @@ def preprocess_digit(img):
 def predict_digits(digit_imgs):
     if not digit_imgs:
         return ""
-    preds = model.predict(np.array(digit_imgs), verbose=0)
+    input_array = np.array(digit_imgs).reshape(-1, 28, 28, 1)
+    preds = model.predict(input_array, verbose=0)
     return ''.join(str(np.argmax(p)) for p in preds)
 
 # ------------------ Streamlit UI -------------------
@@ -71,18 +79,35 @@ if image_file and json_file:
     predictions = []
 
     for inst in data["instances"]:
-        cls = inst["className"]
+        cls = inst.get("className", "")
         if cls not in ["ChqNo", "AccNo", "Amt", "DateIss"]:
             continue
 
-        (x1, y1), (x2, y2) = inst["points"]
-        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+        points = inst["points"]
+
+        # Fix typo in keys
+        if "y1" not in points and "yl" in points:
+            points["y1"] = points.pop("yl")
+
+        try:
+            x1 = int(points["x1"])
+            y1 = int(points["y1"])
+            x2 = int(points["x2"])
+            y2 = int(points["y2"])
+        except Exception as e:
+            st.warning(f"Skipping invalid box for class {cls} due to: {e}")
+            continue
+
         cropped = img_cv[y1:y2, x1:x2]
 
         st.subheader(f"{cls}")
         st.image(cropped, caption=f"Cropped {cls}")
 
         digit_imgs = preprocess_digit(cropped)
+
+        for i, d in enumerate(digit_imgs):
+            st.image(d, caption=f"Digit {i+1} Input", width=60)
+
         pred_str = predict_digits(digit_imgs)
 
         st.markdown(f"**Predicted:** `{pred_str}`")
