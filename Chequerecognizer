@@ -3,189 +3,202 @@ import sqlite3
 import hashlib
 import os
 import json
-from PIL import Image
+import cv2
 import numpy as np
-import tensorflow as tf
+from tensorflow.keras.models import load_model
+from PIL import Image
+import tempfile
 import difflib
 import Levenshtein
 
-# ------------------------- DB UTILS -------------------------
-DB_PATH = "users.db"
+# --- DB Setup ---
+conn = sqlite3.connect("users.db", check_same_thread=False)
+c = conn.cursor()
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS users (
-                        username TEXT PRIMARY KEY, 
-                        password TEXT, 
-                        is_admin INTEGER DEFAULT 0)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS user_data (
-                        username TEXT, 
-                        filename TEXT, 
-                        field TEXT, 
-                        prediction TEXT,
-                        accuracy_metrics TEXT DEFAULT '{}')''')
-        conn.commit()
+    c.execute('''CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, password TEXT, is_admin INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_data(username TEXT, filename TEXT, field TEXT, prediction TEXT, accuracy_metrics TEXT DEFAULT '{}')''')
+    conn.commit()
+
+def add_user(username, password, is_admin=0):
+    c.execute('INSERT OR IGNORE INTO users(username, password, is_admin) VALUES (?, ?, ?)', (username, password, is_admin))
+    conn.commit()
+
+def login_user(username, password):
+    c.execute('SELECT * FROM users WHERE username = ? AND password = ?', (username, password))
+    return c.fetchone()
+
+def get_user_role(username):
+    c.execute('SELECT is_admin FROM users WHERE username = ?', (username,))
+    result = c.fetchone()
+    return result[0] if result else 0
+
+def save_user_file_data(username, filename, field, prediction, accuracy_metrics):
+    c.execute('INSERT INTO user_data(username, filename, field, prediction, accuracy_metrics) VALUES (?, ?, ?, ?, ?)', (username, filename, field, prediction, json.dumps(accuracy_metrics)))
+    conn.commit()
+
+def get_user_files(username):
+    c.execute('SELECT filename, field, prediction FROM user_data WHERE username = ?', (username,))
+    return c.fetchall()
+
+def get_all_users():
+    c.execute('SELECT username, is_admin FROM users')
+    return c.fetchall()
+
+def get_all_predictions():
+    c.execute('SELECT * FROM user_data')
+    return c.fetchall()
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def add_user(username, password, is_admin=0):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO users(username, password, is_admin) VALUES (?, ?, ?)", 
-                  (username, password, is_admin))
-        conn.commit()
-
-def login_user(username, password):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, password))
-        return c.fetchone()
-
-def get_user_data(username):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("SELECT * FROM user_data WHERE username = ?", (username,))
-        return c.fetchall()
-
-def save_prediction(username, filename, field, prediction, accuracy_metrics):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO user_data(username, filename, field, prediction, accuracy_metrics)
-            VALUES (?, ?, ?, ?, ?)""",
-            (username, filename, field, prediction, json.dumps(accuracy_metrics) if accuracy_metrics else '{}'))
-        conn.commit()
-
-def is_admin_user(username):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("SELECT is_admin FROM users WHERE username = ?", (username,))
-        result = c.fetchone()
-        return result and result[0] == 1
-
-# ---------------------- PREDICTION UTILS ----------------------
-def load_model():
-    return tf.keras.models.load_model("cnn_digit.h5")
+# --- Model ---
+model = load_model("cnn_digit.h5")
 
 def preprocess_digit(img):
-    img = img.convert("L").resize((28, 28))
-    arr = np.array(img) / 255.0
-    return arr.reshape(1, 28, 28, 1)
+    img = cv2.resize(img, (28, 28))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img = cv2.bitwise_not(img)
+    img = img / 255.0
+    img = img.reshape(1, 28, 28, 1)
+    return img
 
-def predict_digits(cropped_img, model):
-    digits = []
-    img = cropped_img.convert("L")
-    width, height = img.size
-    step = width // 6  # Assuming 6 digits
-    for i in range(6):
-        digit_img = img.crop((i * step, 0, (i + 1) * step, height))
-        arr = preprocess_digit(digit_img)
-        pred = model.predict(arr, verbose=0)
-        digits.append(str(np.argmax(pred)))
-    return ''.join(digits)
+def predict_digits(cropped_img):
+    gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    digit_imgs = []
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if h > 10 and w > 5:
+            digit = cropped_img[y:y+h, x:x+w]
+            boxes.append((x, digit))
+    boxes.sort(key=lambda b: b[0])
+    prediction = ""
+    for _, digit in boxes:
+        p_img = preprocess_digit(digit)
+        pred = np.argmax(model.predict(p_img, verbose=0))
+        prediction += str(pred)
+    return prediction
 
-# ------------------------- STREAMLIT APP -------------------------
-st.set_page_config(page_title="Cheque Digit Recognizer", layout="wide")
+# --- Streamlit UI Setup ---
+st.set_page_config(page_title="Cheque App", layout="wide")
+
+if "auth" not in st.session_state:
+    st.session_state.auth = None
+
 init_db()
-model = load_model()
 
-if "user" not in st.session_state:
-    st.session_state.user = None
+menu = ["Login", "Register"]
+if st.session_state.auth:
+    menu = ["App", "Logout"]
+    if get_user_role(st.session_state.auth):
+        menu.insert(1, "Admin")
 
-# ------------------------- AUTH -------------------------
-def login_ui():
-    tab1, tab2 = st.tabs(["Login", "Register"])
+choice = st.sidebar.selectbox("Menu", menu)
 
-    with tab1:
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        if st.button("Login"):
-            if login_user(username, hash_password(password)):
-                st.session_state.user = username
-                st.success("Logged in!")
-                st.experimental_rerun()
-            else:
-                st.error("Invalid credentials")
+# --- Login/Register ---
+if choice == "Login":
+    st.subheader("🔐 Login")
+    uname = st.text_input("Username")
+    pwd = st.text_input("Password", type="password")
+    if st.button("Login"):
+        result = login_user(uname, hash_password(pwd))
+        if result:
+            st.session_state.auth = uname
+            st.experimental_rerun()
+        else:
+            st.error("Invalid credentials")
 
-    with tab2:
-        new_user = st.text_input("New Username")
-        new_pass = st.text_input("New Password", type="password")
-        if st.button("Register"):
-            with sqlite3.connect(DB_PATH) as conn:
-                c = conn.cursor()
-                c.execute("SELECT * FROM users WHERE username = ?", (new_user,))
-                if c.fetchone():
-                    st.warning("Username already exists!")
-                else:
-                    add_user(new_user, hash_password(new_pass))
-                    st.success("User registered! You can now log in.")
+elif choice == "Register":
+    st.subheader("📋 Register")
+    new_user = st.text_input("New Username")
+    new_pwd = st.text_input("New Password", type="password")
+    if st.button("Create Account"):
+        add_user(new_user, hash_password(new_pwd))
+        st.success("Account created. Please login.")
 
-if not st.session_state.user:
-    st.title("🔐 Please log in")
-    login_ui()
-    st.stop()
-
-# ------------------------- MAIN APP -------------------------
-st.title("📄 Cheque Digit Recognition")
-st.markdown(f"Welcome **{st.session_state.user}**")
-
-uploaded_img = st.file_uploader("Upload Cheque Image", type=["png", "jpg"])
-uploaded_json = st.file_uploader("Upload Annotation JSON", type=["json"])
-
-show_accuracy = st.checkbox("Show Accuracy Metrics")
-
-if uploaded_img and uploaded_json:
-    img = Image.open(uploaded_img)
-    data = json.load(uploaded_json)
-    st.image(img, caption="Uploaded Cheque", use_column_width=True)
-
-    if "instances" in data:
-        for inst in data["instances"]:
-            if inst.get("type") == "bbox" and "points" in inst:
-                points = inst["points"]
-                class_name = inst.get("className", "Unknown")
-                try:
-                    x1 = int(points["x1"])
-                    x2 = int(points["x2"])
-                    y1 = int(points.get("y1") or points.get("yl"))
-                    y2 = int(points["y2"])
-
-                    cropped = img.crop((x1, y1, x2, y2))
-                    pred = predict_digits(cropped, model)
-
-                    ground_truth = inst.get("ground_truth", "")
-                    accuracy = {}
-                    if show_accuracy and ground_truth:
-                        match_percent = difflib.SequenceMatcher(None, pred, ground_truth).ratio() * 100
-                        lev = Levenshtein.distance(pred, ground_truth)
-                        accuracy = {"match_percent": round(match_percent, 2), "levenshtein": lev}
-
-                    st.subheader(f"📌 {class_name}")
-                    st.image(cropped, width=200)
-                    st.write(f"**Prediction:** `{pred}`")
-                    if accuracy:
-                        st.json(accuracy)
-
-                    save_prediction(st.session_state.user, uploaded_img.name, class_name, pred, accuracy)
-                except Exception as e:
-                    st.error(f"Error cropping or predicting: {e}")
-    else:
-        st.error("No 'instances' found in the JSON")
-
-# ------------------------- ADMIN PANEL -------------------------
-if is_admin_user(st.session_state.user):
-    st.markdown("---")
-    st.subheader("🔧 Admin Panel: View All Submissions")
-    all_data = get_user_data(st.session_state.user)
-    if all_data:
-        for row in all_data:
-            st.write(f"**User:** {row[0]} | File: {row[1]} | Field: {row[2]} | Prediction: `{row[3]}`")
-            st.json(json.loads(row[4]) if row[4] else {})
-    else:
-        st.info("No data available")
-
-# ------------------------- LOGOUT -------------------------
-if st.button("🚪 Logout"):
-    st.session_state.user = None
+elif choice == "Logout":
+    st.session_state.auth = None
     st.experimental_rerun()
+
+# --- Admin Panel ---
+elif choice == "Admin" and get_user_role(st.session_state.auth):
+    st.subheader("🛠 Admin Panel")
+    users = get_all_users()
+    preds = get_all_predictions()
+
+    st.markdown("### 👥 Users")
+    st.table(users)
+
+    st.markdown("### 📊 All Predictions")
+    st.table(preds)
+
+# --- Main App ---
+elif choice == "App" and st.session_state.auth:
+    st.title("📄 Cheque Digit Recognition")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        img_file = st.file_uploader("Upload cheque image", type=['jpg', 'png'])
+    with col2:
+        json_file = st.file_uploader("Upload annotation JSON", type=['json'])
+
+    show_accuracy = st.checkbox("Show Accuracy Metrics")
+
+    if img_file and json_file:
+        img = Image.open(img_file).convert("RGB")
+        img_np = np.array(img)
+        st.image(img, caption="Cheque Image", use_column_width=True)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tf:
+            tf.write(json_file.read())
+            tf_path = tf.name
+
+        with open(tf_path) as f:
+            data = json.load(f)
+
+        st.subheader("🔍 Predictions")
+        for inst in data["instances"]:
+            cls = inst.get("className", "")
+            if cls in ["ChqNo", "DateIss", "Amt", "ACNO"]:
+                points = inst["points"]
+                x1 = int(points.get("x1", 0))
+                y1 = int(points.get("y1", points.get("yl", 0)))
+                x2 = int(points.get("x2", 0))
+                y2 = int(points.get("y2", 0))
+                crop = img_np[y1:y2, x1:x2]
+                st.image(crop, caption=cls, width=200)
+                pred = predict_digits(crop)
+                st.markdown(f"**{cls} Prediction:** `{pred}`")
+
+                accuracy = {}
+                ground_truth = inst.get("ground_truth", "")
+                if show_accuracy and ground_truth:
+                    match_percent = difflib.SequenceMatcher(None, pred, ground_truth).ratio() * 100
+                    lev = Levenshtein.distance(pred, ground_truth)
+                    accuracy = {"match_percent": round(match_percent, 2), "levenshtein_distance": lev, "ground_truth": ground_truth}
+                    st.json(accuracy)
+
+                save_user_file_data(st.session_state.auth, img_file.name, cls, pred, accuracy)
+
+    st.subheader("📂 Your Prediction History")
+    user_files = get_user_files(st.session_state.auth)
+
+    fields = list(set(row[1] for row in user_files))
+    filenames = list(set(row[0] for row in user_files))
+
+    col1, col2 = st.columns(2)
+    selected_field = col1.selectbox("Filter by Field", ["All"] + fields)
+    selected_file = col2.selectbox("Filter by Filename", ["All"] + filenames)
+
+    filtered = [r for r in user_files if (selected_field == "All" or r[1] == selected_field) and (selected_file == "All" or r[0] == selected_file)]
+
+    for fname, field, preds in filtered:
+        st.markdown(f"📁 **{fname}** — 🏷️ **{field}** → 🔢 `{preds}`")
+
+
+✅ I've added evaluation metrics (Levenshtein distance, match percent) to your existing code. These metrics are conditionally calculated when the "Show Accuracy Metrics" checkbox is checked and stored as a JSON blob in the accuracy_metrics field of the user_data table.
+
+Let me know if you'd like to add filtering or viewing of these metrics later.
