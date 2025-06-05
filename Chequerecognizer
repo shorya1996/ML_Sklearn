@@ -34,7 +34,7 @@ def get_user_role(username):
     return result[0] if result else 0
 
 def save_user_file_data(username, filename, field, prediction, accuracy_metrics):
-    c.execute('INSERT INTO user_data(username, filename, field, prediction, accuracy_metrics) VALUES (?, ?, ?, ?, ?)',
+    c.execute('INSERT INTO user_data(username, filename, field, prediction, accuracy_metrics) VALUES (?, ?, ?, ?, ?)', 
               (username, filename, field, prediction, json.dumps(accuracy_metrics) if accuracy_metrics else '{}'))
     conn.commit()
 
@@ -87,8 +87,8 @@ st.set_page_config(page_title="Cheque App", layout="wide")
 
 if "auth" not in st.session_state:
     st.session_state.auth = None
-if "predictions_saved" not in st.session_state:
-    st.session_state.predictions_saved = False
+if "predictions" not in st.session_state:
+    st.session_state.predictions = []
 
 init_db()
 
@@ -148,9 +148,8 @@ elif choice == "App" and st.session_state.auth:
         json_file = st.file_uploader("Upload annotation JSON", type=['json'])
 
     show_accuracy = st.checkbox("Show Accuracy Metrics")
-    accuracy_inputs = {}
 
-    if img_file and json_file and not st.session_state.predictions_saved:
+    if img_file and json_file:
         img = Image.open(img_file).convert("RGB")
         img_np = np.array(img)
         st.image(img, caption="Cheque Image", use_column_width=True)
@@ -162,6 +161,7 @@ elif choice == "App" and st.session_state.auth:
         with open(tf_path) as f:
             data = json.load(f)
 
+        st.session_state.predictions.clear()
         st.subheader("🔍 Predictions")
         for inst in data["instances"]:
             cls = inst.get("className", "")
@@ -174,29 +174,29 @@ elif choice == "App" and st.session_state.auth:
                 crop = img_np[y1:y2, x1:x2]
                 st.image(crop, caption=cls, width=200)
                 pred = predict_digits(crop)
-                st.markdown(f"**{cls} Prediction:** `{pred}`")
 
                 accuracy_metrics = {}
-                if show_accuracy:
-                    gt = st.text_input(f"Enter ground truth for {cls}", key=f"gt_{cls}")
-                    if gt:
-                        match_percent = difflib.SequenceMatcher(None, pred, gt).ratio() * 100
-                        lev = Levenshtein.distance(pred, gt)
-                        accuracy_metrics = {"match_percent": round(match_percent, 2), "levenshtein": lev}
-                        st.json(accuracy_metrics)
+                gt = st.text_input(f"Enter Ground Truth for {cls}", key=f"gt_{cls}")
+                if show_accuracy and gt:
+                    match_percent = difflib.SequenceMatcher(None, pred, gt).ratio() * 100
+                    lev_dist = Levenshtein.distance(pred, gt)
+                    accuracy_metrics = {
+                        "match_percent": round(match_percent, 2),
+                        "levenshtein": lev_dist
+                    }
+                    st.json(accuracy_metrics)
 
-                accuracy_inputs[cls] = (pred, accuracy_metrics)
+                st.session_state.predictions.append({
+                    "filename": img_file.name,
+                    "field": cls,
+                    "prediction": pred,
+                    "accuracy": accuracy_metrics
+                })
 
-        if st.button("✅ Save All Predictions"):
-            for cls, (pred, metrics) in accuracy_inputs.items():
-                save_user_file_data(st.session_state.auth, img_file.name, cls, pred, metrics)
-            st.session_state.predictions_saved = True
-            st.success("Predictions saved!")
-
-    if st.session_state.predictions_saved:
-        if st.button("🔁 Reset Prediction"):
-            st.session_state.predictions_saved = False
-            st.experimental_rerun()
+        if st.button("💾 Save All Results"):
+            for item in st.session_state.predictions:
+                save_user_file_data(st.session_state.auth, item["filename"], item["field"], item["prediction"], item["accuracy"])
+            st.success("All results saved!")
 
     st.subheader("📂 Your Prediction History")
     user_files = get_user_files(st.session_state.auth)
@@ -210,19 +210,12 @@ elif choice == "App" and st.session_state.auth:
 
     filtered = [r for r in user_files if (selected_field == "All" or r[1] == selected_field) and (selected_file == "All" or r[0] == selected_file)]
 
-    for fname, field, preds, acc in filtered:
+    for fname, field, preds, metrics in filtered:
         st.markdown(f"📁 **{fname}** — 🏷️ **{field}** → 🔢 `{preds}`")
-        if acc:
-            st.json(json.loads(acc))
+        if metrics:
+            st.json(json.loads(metrics))
 
 
-✅ Accuracy metrics are now calculated, displayed, and saved to the database only after clicking the "Save All Predictions" button. Each prediction row in your database includes a accuracy_metrics JSON blob.
+✅ Integrated a single "Save All Results" button that stores both prediction and accuracy metrics (if available) into the database. The user_data table now includes an accuracy_metrics column to support this.
 
-Let me know if you want to:
-
-Add editing capabilities for ground truth.
-
-Export metrics to CSV.
-
-Compute overall accuracy across fields or files.
-
+Let me know if you'd like the results shown in a downloadable format or editable later.
