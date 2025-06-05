@@ -1,0 +1,192 @@
+import streamlit as st
+import sqlite3
+import hashlib
+import os
+import json
+from PIL import Image
+import numpy as np
+import tensorflow as tf
+import difflib
+import Levenshtein
+
+# ------------------------- DB UTILS -------------------------
+DB_PATH = "users.db"
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+                        username TEXT PRIMARY KEY, 
+                        password TEXT, 
+                        is_admin INTEGER DEFAULT 0)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS user_data (
+                        username TEXT, 
+                        filename TEXT, 
+                        field TEXT, 
+                        prediction TEXT,
+                        accuracy_metrics TEXT)''')
+        conn.commit()
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def add_user(username, password, is_admin=0):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users(username, password, is_admin) VALUES (?, ?, ?)", 
+                  (username, password, is_admin))
+        conn.commit()
+
+def login_user(username, password):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, password))
+        return c.fetchone()
+
+def get_user_data(username):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM user_data WHERE username = ?", (username,))
+        return c.fetchall()
+
+def save_prediction(username, filename, field, prediction, accuracy_metrics):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO user_data(username, filename, field, prediction, accuracy_metrics)
+            VALUES (?, ?, ?, ?, ?)""",
+            (username, filename, field, prediction, json.dumps(accuracy_metrics)))
+        conn.commit()
+
+def is_admin_user(username):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT is_admin FROM users WHERE username = ?", (username,))
+        result = c.fetchone()
+        return result and result[0] == 1
+
+# ---------------------- PREDICTION UTILS ----------------------
+def load_model():
+    return tf.keras.models.load_model("cnn_digit.h5")
+
+def preprocess_digit(img):
+    img = img.convert("L").resize((28, 28))
+    arr = np.array(img) / 255.0
+    return arr.reshape(1, 28, 28, 1)
+
+def predict_digits(cropped_img, model):
+    digits = []
+    img = cropped_img.convert("L")
+    width, height = img.size
+    # Split evenly assuming monospace digits
+    step = width // 6  # Assuming 6 digits; adjust if needed
+    for i in range(6):
+        digit_img = img.crop((i * step, 0, (i + 1) * step, height))
+        arr = preprocess_digit(digit_img)
+        pred = model.predict(arr, verbose=0)
+        digits.append(str(np.argmax(pred)))
+    return ''.join(digits)
+
+# ------------------------- STREAMLIT APP -------------------------
+st.set_page_config(page_title="Cheque Digit Recognizer", layout="wide")
+init_db()
+model = load_model()
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+# ------------------------- AUTH -------------------------
+def login_ui():
+    tab1, tab2 = st.tabs(["Login", "Register"])
+
+    with tab1:
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            if login_user(username, hash_password(password)):
+                st.session_state.user = username
+                st.success("Logged in!")
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+
+    with tab2:
+        new_user = st.text_input("New Username")
+        new_pass = st.text_input("New Password", type="password")
+        if st.button("Register"):
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute("SELECT * FROM users WHERE username = ?", (new_user,))
+                if c.fetchone():
+                    st.warning("Username already exists!")
+                else:
+                    add_user(new_user, hash_password(new_pass))
+                    st.success("User registered! You can now log in.")
+
+if not st.session_state.user:
+    st.title("🔐 Please log in")
+    login_ui()
+    st.stop()
+
+# ------------------------- MAIN APP -------------------------
+st.title("📄 Cheque Digit Recognition")
+st.markdown(f"Welcome **{st.session_state.user}**")
+
+uploaded_img = st.file_uploader("Upload Cheque Image", type=["png", "jpg"])
+uploaded_json = st.file_uploader("Upload Annotation JSON", type=["json"])
+
+show_accuracy = st.checkbox("Show Accuracy Metrics")
+
+if uploaded_img and uploaded_json:
+    img = Image.open(uploaded_img)
+    data = json.load(uploaded_json)
+    st.image(img, caption="Uploaded Cheque", use_column_width=True)
+
+    if "instances" in data:
+        for inst in data["instances"]:
+            if inst.get("type") == "bbox" and "points" in inst:
+                points = inst["points"]
+                class_name = inst.get("className", "Unknown")
+                try:
+                    x1 = int(points["x1"])
+                    x2 = int(points["x2"])
+                    y1 = int(points.get("y1") or points.get("yl"))
+                    y2 = int(points["y2"])
+
+                    cropped = img.crop((x1, y1, x2, y2))
+                    pred = predict_digits(cropped, model)
+
+                    ground_truth = inst.get("ground_truth", "")  # Use key if exists
+                    accuracy = {}
+                    if show_accuracy and ground_truth:
+                        match_percent = difflib.SequenceMatcher(None, pred, ground_truth).ratio() * 100
+                        lev = Levenshtein.distance(pred, ground_truth)
+                        accuracy = {"match_percent": round(match_percent, 2), "levenshtein": lev}
+
+                    st.subheader(f"📌 {class_name}")
+                    st.image(cropped, width=200)
+                    st.write(f"**Prediction:** `{pred}`")
+                    if accuracy:
+                        st.json(accuracy)
+
+                    save_prediction(st.session_state.user, uploaded_img.name, class_name, pred, accuracy)
+                except Exception as e:
+                    st.error(f"Error cropping or predicting: {e}")
+    else:
+        st.error("No 'instances' found in the JSON")
+
+# ------------------------- ADMIN PANEL -------------------------
+if is_admin_user(st.session_state.user):
+    st.markdown("---")
+    st.subheader("🔧 Admin Panel: View All Submissions")
+    all_data = get_user_data(st.session_state.user)
+    if all_data:
+        for row in all_data:
+            st.write(f"**User:** {row[0]} | File: {row[1]} | Field: {row[2]} | Prediction: `{row[3]}`")
+            st.json(json.loads(row[4]) if row[4] else {})
+    else:
+        st.info("No data available")
+
+# ------------------------- LOGOUT -------------------------
+if st.button("🚪 Logout"):
+    st.session_state.user = None
+    st.rerun()
