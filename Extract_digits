@@ -1,105 +1,125 @@
-import streamlit as st import cv2 import numpy as np import json import os from tensorflow.keras.models import load_model from PIL import Image import pandas as pd import tempfile import Levenshtein
+import streamlit as st
+import cv2
+import numpy as np
+import json
+import os
+from tensorflow.keras.models import load_model
+from PIL import Image
+import pandas as pd
+import tempfile
+import Levenshtein
 
-Load model
+# Load model
+model_path = "cnn_digit.h5"  # Change this to your model path
+model = load_model(model_path)
 
-model_path = "cnn_digit.h5"  # Change this to your model path model = load_model(model_path)
+# Image preprocessing for digit prediction
+def preprocess_digit(img):
+    img = cv2.resize(img, (28, 28))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img = cv2.bitwise_not(img)
+    img = img / 255.0
+    img = img.reshape(1, 28, 28, 1)
+    return img
 
-Image preprocessing for digit prediction
+# Predict digits from image crop
+def predict_digits(cropped_img):
+    gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-def preprocess_digit(img): img = cv2.resize(img, (28, 28)) img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) img = cv2.bitwise_not(img) img = img / 255.0 img = img.reshape(1, 28, 28, 1) return img
+    digit_imgs = []
+    boxes = []
 
-Predict digits from image crop
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if h > 10 and w > 5:
+            digit = cropped_img[y:y+h, x:x+w]
+            digit_imgs.append(digit)
+            boxes.append((x, digit))
 
-def predict_digits(cropped_img): gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY) _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU) contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes.sort(key=lambda b: b[0])
 
-digit_imgs = []
-boxes = []
+    prediction = ""
+    for _, digit in boxes:
+        p_img = preprocess_digit(digit)
+        pred = np.argmax(model.predict(p_img, verbose=0))
+        prediction += str(pred)
+    return prediction
 
-for cnt in contours:
-    x, y, w, h = cv2.boundingRect(cnt)
-    if h > 10 and w > 5:
-        digit = cropped_img[y:y+h, x:x+w]
-        digit_imgs.append(digit)
-        boxes.append((x, digit))
+# Evaluation Metrics
+def char_accuracy(pred, actual):
+    matches = sum(p == a for p, a in zip(pred, actual))
+    return matches / max(len(pred), len(actual)) if actual else 0
 
-boxes.sort(key=lambda b: b[0])
+def edit_distance(pred, actual):
+    return Levenshtein.distance(pred, actual)
 
-prediction = ""
-for _, digit in boxes:
-    p_img = preprocess_digit(digit)
-    pred = np.argmax(model.predict(p_img, verbose=0))
-    prediction += str(pred)
-return prediction
+def exact_match(pred, actual):
+    return int(pred == actual)
 
-Evaluation Metrics
-
-def char_accuracy(pred, actual): matches = sum(p == a for p, a in zip(pred, actual)) return matches / max(len(pred), len(actual)) if actual else 0
-
-def edit_distance(pred, actual): return Levenshtein.distance(pred, actual)
-
-def exact_match(pred, actual): return int(pred == actual)
-
-Streamlit UI
-
+# Streamlit UI
 st.title("Cheque Digit Recognition App")
 
-img_file = st.file_uploader("Upload cheque image", type=['jpg', 'png']) json_file = st.file_uploader("Upload annotation JSON", type=['json'])
+img_file = st.file_uploader("Upload cheque image", type=['jpg', 'png'])
+json_file = st.file_uploader("Upload annotation JSON", type=['json'])
 
-if img_file and json_file: img = Image.open(img_file).convert("RGB") img_np = np.array(img)
+if img_file and json_file:
+    img = Image.open(img_file).convert("RGB")
+    img_np = np.array(img)
 
-with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tf:
-    tf.write(json_file.read())
-    tf_path = tf.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tf:
+        tf.write(json_file.read())
+        tf_path = tf.name
 
-with open(tf_path) as f:
-    data = json.load(f)
+    with open(tf_path) as f:
+        data = json.load(f)
 
-predictions = {}
-actuals = {}
-cropped_images = {}
+    predictions = {}
+    actuals = {}
+    cropped_images = {}
 
-for inst in data["instances"]:
-    cls = inst.get("className", "")
-    if cls in ["ChqNo", "DateIss", "Amt", "ACNO"]:
-        points = inst["points"]
-        x1 = int(points.get("x1", 0))
-        y1 = int(points.get("y1", points.get("yl", 0)))
-        x2 = int(points.get("x2", 0))
-        y2 = int(points.get("y2", 0))
-        crop = img_np[y1:y2, x1:x2]
-        cropped_images[cls] = crop
-        pred = predict_digits(crop)
-        predictions[cls] = pred
+    for inst in data["instances"]:
+        cls = inst.get("className", "")
+        if cls in ["ChqNo", "DateIss", "Amt", "ACNO"]:
+            points = inst["points"]
+            x1 = int(points.get("x1", 0))
+            y1 = int(points.get("y1", points.get("yl", 0)))
+            x2 = int(points.get("x2", 0))
+            y2 = int(points.get("y2", 0))
+            crop = img_np[y1:y2, x1:x2]
+            cropped_images[cls] = crop
+            pred = predict_digits(crop)
+            predictions[cls] = pred
 
-results = []
-for cls in ["ChqNo", "DateIss", "Amt", "ACNO"]:
-    if cls in cropped_images:
-        st.subheader(cls)
-        st.image(cropped_images[cls], caption=f"Cropped {cls}")
-        st.markdown(f"**Predicted:** `{predictions[cls]}`")
-        actual = st.text_input(f"Enter actual value for {cls}", key=cls)
-        actuals[cls] = actual
+    results = []
+    for cls in ["ChqNo", "DateIss", "Amt", "ACNO"]:
+        if cls in cropped_images:
+            st.subheader(cls)
+            st.image(cropped_images[cls], caption=f"Cropped {cls}")
+            st.markdown(f"**Predicted:** `{predictions[cls]}`")
+            actual = st.text_input(f"Enter actual value for {cls}", key=cls)
+            actuals[cls] = actual
 
-        if actual:
-            acc = char_accuracy(predictions[cls], actual)
-            dist = edit_distance(predictions[cls], actual)
-            exact = exact_match(predictions[cls], actual)
-            st.markdown(f"- Character Accuracy: `{acc:.2f}`")
-            st.markdown(f"- Edit Distance: `{dist}`")
-            st.markdown(f"- Exact Match: `{exact}`")
+            if actual:
+                acc = char_accuracy(predictions[cls], actual)
+                dist = edit_distance(predictions[cls], actual)
+                exact = exact_match(predictions[cls], actual)
+                st.markdown(f"- Character Accuracy: `{acc:.2f}`")
+                st.markdown(f"- Edit Distance: `{dist}`")
+                st.markdown(f"- Exact Match: `{exact}`")
 
-        results.append({
-            "Field": cls,
-            "Predicted": predictions[cls],
-            "Actual": actual,
-            "CharAccuracy": char_accuracy(predictions[cls], actual) if actual else None,
-            "EditDistance": edit_distance(predictions[cls], actual) if actual else None,
-            "ExactMatch": exact_match(predictions[cls], actual) if actual else None
-        })
+            results.append({
+                "Field": cls,
+                "Predicted": predictions[cls],
+                "Actual": actual,
+                "CharAccuracy": char_accuracy(predictions[cls], actual) if actual else None,
+                "EditDistance": edit_distance(predictions[cls], actual) if actual else None,
+                "ExactMatch": exact_match(predictions[cls], actual) if actual else None
+            })
 
-if st.button("Save to CSV"):
-    df = pd.DataFrame(results)
-    csv_path = "predictions.csv"
-    df.to_csv(csv_path, index=False)
-    st.success(f"Predictions saved to {csv_path}")
-
+    if st.button("Save to CSV"):
+        df = pd.DataFrame(results)
+        csv_path = "predictions.csv"
+        df.to_csv(csv_path, index=False)
+        st.success(f"Predictions saved to {csv_path}")
