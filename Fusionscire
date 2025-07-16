@@ -1,0 +1,48 @@
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve
+
+# Assume df contains:
+# 'model1_score', 'model2_score', 'model3_score', and 'is_fraud'
+
+def weighted_fusion(df, y_true, weights):
+    # weights = (w1, w2, w3)
+    fusion_score = (
+        weights[0] * df['model1_score'] +
+        weights[1] * df['model2_score'] +
+        weights[2] * df['model3_score']
+    )
+    return fusion_score
+
+def find_best_weights(df, y_true):
+    best_auc = 0
+    best_weights = None
+    best_f1 = 0
+
+    # Try different combinations of weights
+    for w1 in np.arange(0, 1.1, 0.1):
+        for w2 in np.arange(0, 1.1 - w1, 0.1):
+            w3 = 1.0 - w1 - w2
+            if w3 < 0:
+                continue
+
+            fusion_score = weighted_fusion(df, y_true, (w1, w2, w3))
+            precision, recall, thresholds = precision_recall_curve(y_true, fusion_score)
+            f1s = 2 * precision * recall / (precision + recall + 1e-8)
+            best_f1_for_weights = np.max(f1s)
+            auc = roc_auc_score(y_true, fusion_score)
+
+            if best_f1_for_weights > best_f1:
+                best_f1 = best_f1_for_weights
+                best_auc = auc
+                best_weights = (w1, w2, w3)
+
+    return best_weights, best_auc, best_f1
+
+# Usage
+y_true = df['is_fraud']
+best_weights, best_auc, best_f1 = find_best_weights(df, y_true)
+print(f"Best Weights: {best_weights}, AUC: {best_auc:.4f}, F1: {best_f1:.4f}")
+
+# Final fusion score
+df['fusion_score'] = weighted_fusion(df, y_true, best_weights)
