@@ -1,0 +1,56 @@
+import pandas as pd
+import numpy as np
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import mutual_info_classif
+
+# ====== STEP 1: Load your data ======
+# Replace this with your own data loading step
+# Example:
+# df = pd.read_csv('your_data.csv')
+
+# ====== STEP 2: Separate target and features ======
+target_col = 'fraud_flag'
+X = df.drop(columns=[target_col])
+y = df[target_col]
+
+# ====== STEP 3: Handle Missing Values ======
+
+# Separate numerical and categorical columns
+num_cols = X.select_dtypes(include='number').columns
+cat_cols = X.select_dtypes(include='object').columns
+
+# Impute numerical with median
+imp_num = SimpleImputer(strategy='median')
+X_num = pd.DataFrame(imp_num.fit_transform(X[num_cols]), columns=num_cols)
+
+# Impute categorical with "Missing" label
+X_cat = X[cat_cols].fillna('Missing')
+
+# ====== STEP 4: Encode Categorical Variables ======
+X_cat_encoded = pd.get_dummies(X_cat, drop_first=False)
+
+# ====== STEP 5: Combine all features ======
+X_final = pd.concat([X_num, X_cat_encoded], axis=1)
+
+# ====== STEP 6: Calculate Correlation (only for numeric-like data) ======
+# Convert target to numeric if not already
+if y.dtype != 'int64' and y.dtype != 'float64':
+    y = y.astype('category').cat.codes
+
+correlations = X_final.corrwith(y).abs()
+
+# ====== STEP 7: Calculate Mutual Information ======
+mi_scores = mutual_info_classif(X_final, y, discrete_features='auto', random_state=0)
+
+# ====== STEP 8: Combine Results ======
+results = pd.DataFrame({
+    'Feature': X_final.columns,
+    'Correlation (abs)': correlations,
+    'Mutual Information': mi_scores
+})
+
+results_sorted = results.sort_values(by='Mutual Information', ascending=False)
+
+# ====== STEP 9: Display Top Features ======
+print("\nTop features by Mutual Information:\n")
+print(results_sorted.head(15))
