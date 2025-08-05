@@ -1,0 +1,62 @@
+import pandas as pd
+import numpy as np
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ========== Step 1: Load your dataset ==========
+# Replace this with your actual data
+# Example:
+# df = pd.read_csv("your_data.csv")
+
+# Assume target column is named 'fraud_flag'
+target_col = 'fraud_flag'
+X_raw = df.drop(columns=[target_col])
+y = df[target_col]
+
+# ========== Step 2: Handle missing values ==========
+
+# Separate numeric and categorical columns
+num_cols = X_raw.select_dtypes(include='number').columns
+cat_cols = X_raw.select_dtypes(include='object').columns
+
+# Impute numeric with median
+imp_num = SimpleImputer(strategy='median')
+X_num = pd.DataFrame(imp_num.fit_transform(X_raw[num_cols]), columns=num_cols)
+
+# Only keep low-cardinality categoricals (<=10 unique values) to avoid memory issues
+low_card_cat = [col for col in cat_cols if X_raw[col].nunique() <= 10]
+X_cat = X_raw[low_card_cat].fillna('Missing')
+
+# One-hot encode
+X_cat_encoded = pd.get_dummies(X_cat, drop_first=False)
+
+# ========== Step 3: Combine numeric and encoded categorical data ==========
+X_final = pd.concat([X_num, X_cat_encoded], axis=1)
+
+# ========== Step 4: Standardize for PCA ==========
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_final)
+
+# ========== Step 5: Perform PCA ==========
+pca = PCA(n_components=2, random_state=42)
+X_pca = pca.fit_transform(X_scaled)
+
+# ========== Step 6: Create DataFrame for plotting ==========
+df_pca = pd.DataFrame(X_pca, columns=["PC1", "PC2"])
+df_pca["fraud_flag"] = y.values
+
+# ========== Step 7: Plot PCA ==========
+plt.figure(figsize=(8, 6))
+sns.scatterplot(data=df_pca, x="PC1", y="PC2", hue="fraud_flag", palette="coolwarm", alpha=0.7)
+plt.title("PCA: Linear Projection (PC1 vs PC2)")
+plt.grid(True)
+plt.show()
+
+# ========== Step 8: Print Explained Variance ==========
+explained = pca.explained_variance_ratio_
+print(f"\nExplained Variance by PC1: {explained[0]:.2%}")
+print(f"Explained Variance by PC2: {explained[1]:.2%}")
+print(f"Total (PC1 + PC2): {(explained[0] + explained[1]):.2%}")
