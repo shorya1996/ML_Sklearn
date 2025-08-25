@@ -1,0 +1,113 @@
+import numpy as np
+import pandas as pd
+
+# ----------------------------
+# Core PDO utilities
+# ----------------------------
+def pdo_params(PDO=20, target_score=600, target_odds=50):
+    """
+    Returns (offset, factor) for score = offset + factor * logit(odds_of_good).
+    target_odds is "good:bad" at target_score (e.g., 50 means 50:1).
+    """
+    factor = PDO / np.log(2.0)
+    offset = target_score - factor * np.log(target_odds)
+    return offset, factor
+
+def score_from_prob(
+    p_bad,
+    PDO=20,
+    target_score=600,
+    target_odds=50,
+    higher_is_safer=True,
+    clamp_range=None,      # e.g., (300, 900) or None
+    round_to_int=True,
+    clip_eps=1e-12         # numerical stability near 0/1
+):
+    """
+    Convert probabilities to scores using PDO scaling.
+
+    Parameters
+    ----------
+    p_bad : array-like
+        Probability of bad/fraud = 1 from your model.
+    PDO : int or float
+        Points to double the odds.
+    target_score : int or float
+        The score you want at the target odds (anchor).
+    target_odds : int or float
+        "Good:Bad" odds at target_score (e.g., 50 => 50:1).
+    higher_is_safer : bool
+        If True, scores increase as risk decreases (credit-style).
+        If False, scores increase as risk increases (risk score).
+    clamp_range : tuple or None
+        If set, clamp scores to (low, high), e.g., (300, 900).
+    round_to_int : bool
+        If True, rounds scores to nearest integer.
+    clip_eps : float
+        Small epsilon to avoid log(0) issues.
+
+    Returns
+    -------
+    scores : numpy array (int if round_to_int else float)
+    """
+    p_bad = np.asarray(p_bad, dtype=float)
+    # Choose probability of "good" or "bad" based on desired direction
+    if higher_is_safer:
+        p = 1.0 - p_bad  # P(good)
+    else:
+        p = p_bad        # P(bad)
+
+    # Numerical stability
+    p = np.clip(p, clip_eps, 1 - clip_eps)
+
+    # Params and score
+    offset, factor = pdo_params(PDO, target_score, target_odds)
+    logit = np.log(p / (1.0 - p))              # log-odds of chosen class
+    scores = offset + factor * logit
+
+    if clamp_range is not None:
+        low, high = clamp_range
+        scores = np.clip(scores, low, high)
+
+    if round_to_int:
+        scores = np.rint(scores).astype(int)
+
+    return scores
+
+# ----------------------------
+# Example usage
+# ----------------------------
+# Suppose you already have probabilities from XGBoost:
+#   probs_bad = xgb_model.predict_proba(X_test)[:, 1]    # P(bad=1)
+# or if you used xgboost.XGBClassifier, predict_proba works as above.
+
+# Example placeholders:
+# probs_bad = np.array([0.02, 0.10, 0.35, 0.80, 0.97])
+
+# Typical credit-style setup: higher score = safer
+# scores = score_from_prob(
+#     probs_bad,
+#     PDO=20,
+#     target_score=600,
+#     target_odds=50,
+#     higher_is_safer=True,
+#     clamp_range=(300, 900),   # optional
+#     round_to_int=True
+# )
+
+# If you want a risk score (higher = riskier):
+# risk_scores = score_from_prob(
+#     probs_bad,
+#     PDO=20,
+#     target_score=600,
+#     target_odds=50,
+#     higher_is_safer=False,
+#     clamp_range=None,
+#     round_to_int=True
+# )
+
+# If you want a DataFrame with both:
+# df_scores = pd.DataFrame({"p_bad": probs_bad})
+# df_scores["score_safer_higher"] = score_from_prob(df_scores["p_bad"], PDO=20, target_score=600, target_odds=50, higher_is_safer=True, clamp_range=(300,900))
+# df_scores["score_risk_higher"]  = score_from_prob(df_scores["p_bad"], PDO=20, target_score=600, target_odds=50, higher_is_safer=False)
+# print(df_scores.head())
