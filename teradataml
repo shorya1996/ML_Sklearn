@@ -1,41 +1,45 @@
 from teradataml import create_context, DataFrame, case
 
-# 1) connect (run in same kernel)
+# Connect
 create_context(host="your_host", username="your_user", password="your_pw", logmech="LDAP")
 
-# 2) load tables as proxy DataFrames (no data movement)
-tx = DataFrame("your_db.txn_table")     # transactional table
-acct = DataFrame("your_db.account_table")  # account reference table
+# Load tables
+tx = DataFrame("your_db.txn_table")
+acct = DataFrame("your_db.account_table")
 
-# 3) apply any filters on each table first (best practice)
-tx_f = tx[
-    (tx.txn_date >= '2025-08-01') &
-    (tx.txn_date <= '2025-08-31') &
-    (tx.amount > 1000)
+# Join on 3 conditions:
+#   t.account_id = a.account_id
+#   t.country = a.country
+#   t.segment = a.segment
+joined = tx.join_expr(
+    right=acct,
+    expr=(
+        (tx.account_id == acct.account_id) &
+        (tx.country == acct.country) &
+        (tx.segment == acct.segment)
+    ),
+    how="inner"
+)
+
+# Apply WHERE conditions after join
+joined_filtered = joined[
+    (joined.txn_date >= '2025-08-01') &
+    (joined.txn_date <= '2025-08-31') &
+    (joined.amount > 1000) &
+    (acct.status == 'ACTIVE')
 ]
 
-acct_f = acct[acct.status == 'ACTIVE']   # example small filter
-
-# 4) join (use merge; specify how="inner"/"left" etc. and 'on' key(s))
-# If column names clash, refer via left/right frame e.g. tx.account_id, acct.account_id
-joined = tx_f.merge(acct_f, left_on="account_id", right_on="account_id", how="inner")
-
-# 5) add a CASE WHEN column using teradataml.case
-joined = joined.assign(
+# Add CASE WHEN
+joined_filtered = joined_filtered.assign(
     amount_band = case(
-        [(joined.amount > 10000, "High"),
-         ((joined.amount >= 5000) & (joined.amount <= 10000), "Medium")],
+        [(joined_filtered.amount > 10000, "High"),
+         ((joined_filtered.amount >= 5000) & (joined_filtered.amount <= 10000), "Medium")],
         else_="Low"
     )
 )
 
-# 6) choose exactly 3 output columns (alias if you want)
-# e.g., choose account_id, txn_date, amount_band (or amount instead of band)
-result = joined[["account_id", "txn_date", "amount_band"]]
+# Select final columns
+result = joined_filtered[["account_id", "txn_date", "amount_band"]]
 
-# 7) safe preview (only pulls small number)
+# Preview
 print(result.head(20))
-
-# 8) to pandas if needed (only small sample)
-pdf = result.head(200).to_pandas()
-print(pdf.head())
