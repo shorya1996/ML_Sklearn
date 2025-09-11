@@ -1,0 +1,288 @@
+# ---------------------------
+# End-to-end: Time-to-first-fraud (Teradata + teradataml + lifelines)
+# Jupyter-ready (run cell-by-cell)
+# ---------------------------
+# Requirements:
+# pip install teradataml lifelines pandas scikit-learn pyarrow
+# You must have network access and credentials for Teradata.
+# ---------------------------
+
+# CELL 1: Imports & connection
+from teradataml import create_context, remove_context, DataFrame, to_pandas
+from teradataml.dataframe.copy_to import copy_to_sql
+import pandas as pd
+import numpy as np
+from lifelines import CoxPHFitter
+from sklearn.model_selection import train_test_split
+import pickle
+import time
+
+# === EDIT THESE BEFORE RUNNING ===
+TD_HOST = "your_td_host"
+TD_USER = "your_user"
+TD_PWD  = "your_pwd"
+# For fast prototyping set DAYS_BACK=30 then increase to 90/365 for production
+DAYS_BACK = 30
+SNAPSHOT_OFFSET = 90   # snapshot_date = CURRENT_DATE - SNAPSHOT_OFFSET
+NON_EVENT_SAMPLE_RATIO = 0.02  # 2% sample of non-events for training
+# =================================
+
+create_context(host=TD_HOST, username=TD_USER, password=TD_PWD, logmech="LDAP")
+print("Connected to Teradata.")
+
+# CELL 2: Single CTE to create surv_account (materializes a table in Teradata)
+# This will: union recent txns, build daily_agg, compute 7/30/90 features, find first fraud (fraud_flag=1),
+# and create surv_account (one row per account with duration & features).
+# NOTE: For production set DAYS_BACK larger (90 or 365). For testing set to 30.
+create_surv_sql = f"""
+CREATE MULTISET TABLE surv_account AS
+(
+WITH
+params AS (
+  SELECT (CURRENT_DATE - {SNAPSHOT_OFFSET}) AS snapshot_date,
+         (SELECT MAX(CAST(txn_dt AS DATE))
+            FROM
+            (
+              SELECT txn_dt FROM trans_ct
+              UNION ALL SELECT txn_dt FROM trans_2508
+              UNION ALL SELECT txn_dt FROM trans_2507
+            ) AS all_tx
+         ) AS dataset_end
+),
+
+unioned AS (
+  SELECT account_number, CAST(txn_dt AS DATE) AS txn_dt, amount, decision, mcc, fraud_flag
+  FROM trans_ct
+  WHERE CAST(txn_dt AS DATE) BETWEEN (SELECT snapshot_date FROM params) - {DAYS_BACK} AND (SELECT dataset_end FROM params)
+  UNION ALL
+  SELECT account_number, CAST(txn_dt AS DATE) AS txn_dt, amount, decision, mcc, fraud_flag
+  FROM trans_2508
+  WHERE CAST(txn_dt AS DATE) BETWEEN (SELECT snapshot_date FROM params) - {DAYS_BACK} AND (SELECT dataset_end FROM params)
+  UNION ALL
+  SELECT account_number, CAST(txn_dt AS DATE) AS txn_dt, amount, decision, mcc, fraud_flag
+  FROM trans_2507
+  WHERE CAST(txn_dt AS DATE) BETWEEN (SELECT snapshot_date FROM params) - {DAYS_BACK} AND (SELECT dataset_end FROM params)
+),
+
+daily_agg AS (
+  SELECT account_number,
+         txn_dt,
+         COUNT(*)                                AS txn_count_day,
+         SUM(CASE WHEN decision = 'DECLINE' THEN 1 ELSE 0 END) AS decline_count_day,
+         SUM(COALESCE(amount,0))                 AS sum_amount_day
+  FROM unioned
+  GROUP BY account_number, txn_dt
+),
+
+aggr_account AS (
+  SELECT
+    d.account_number,
+    SUM(CASE WHEN d.txn_dt BETWEEN p.snapshot_date - 6  AND p.snapshot_date - 1 THEN d.txn_count_day ELSE 0 END)  AS txn_7d,
+    SUM(CASE WHEN d.txn_dt BETWEEN p.snapshot_date - 29 AND p.snapshot_date - 1 THEN d.txn_count_day ELSE 0 END)  AS txn_30d,
+    SUM(CASE WHEN d.txn_dt BETWEEN p.snapshot_date - 89 AND p.snapshot_date - 1 THEN d.txn_count_day ELSE 0 END)  AS txn_90d,
+    SUM(CASE WHEN d.txn_dt BETWEEN p.snapshot_date - 29 AND p.snapshot_date - 1 THEN d.decline_count_day ELSE 0 END) AS decline_30d,
+    SUM(CASE WHEN d.txn_dt BETWEEN p.snapshot_date - 89 AND p.snapshot_date - 1 THEN d.sum_amount_day ELSE 0 END) AS sum_amt_90d
+  FROM daily_agg d
+  CROSS JOIN params p
+  GROUP BY d.account_number
+),
+
+first_fraud AS (
+  SELECT u.account_number,
+         MIN(u.txn_dt) AS first_fraud_date
+  FROM unioned u
+  WHERE u.fraud_flag = 1
+  GROUP BY u.account_number
+)
+
+SELECT
+  a.account_number,
+  p.snapshot_date,
+  COALESCE(f.first_fraud_date, p.dataset_end) AS end_date,
+  CASE WHEN f.first_fraud_date IS NOT NULL THEN 1 ELSE 0 END AS event,
+  (COALESCE(f.first_fraud_date, p.dataset_end) - p.snapshot_date) AS duration_days,
+  COALESCE(ag.txn_7d,0)   AS txn_7d,
+  COALESCE(ag.txn_30d,0)  AS txn_30d,
+  COALESCE(ag.txn_90d,0)  AS txn_90d,
+  CASE WHEN COALESCE(ag.txn_30d,0) > 0 THEN CAST(ag.decline_30d AS FLOAT)/CAST(ag.txn_30d AS FLOAT) ELSE 0 END AS decline_rate_30d,
+  COALESCE(ag.sum_amt_90d,0) AS sum_amt_90d
+FROM (SELECT DISTINCT account_number FROM daily_agg) a
+CROSS JOIN params p
+LEFT JOIN aggr_account ag ON a.account_number = ag.account_number
+LEFT JOIN first_fraud f ON a.account_number = f.account_number
+) WITH DATA PRIMARY INDEX (account_number);
+"""
+
+print("Submitting surv_account creation SQL (this can take time)...")
+start = time.time()
+DataFrame.from_query(create_surv_sql)
+print("Submitted; elapsed (s):", time.time()-start)
+
+# CELL 3: Quick sanity checks in DB (counts)
+try:
+    counts_df = to_pandas(DataFrame.from_query("SELECT COUNT(*) AS total_accounts, SUM(event) AS total_events, AVG(duration_days) AS avg_followup FROM surv_account"))
+    print(counts_df)
+except Exception as e:
+    print("Could not fetch counts (maybe query still running):", e)
+
+# CELL 4: Create sampled modeling table in Teradata (keep all events, sample non-events)
+# This keeps all fraud accounts (events) and samples non-events for manageable training size.
+create_modeling_sql = f"""
+CREATE MULTISET TABLE surv_modeling AS
+(
+SELECT * FROM surv_account WHERE event = 1
+UNION ALL
+SELECT * FROM surv_account WHERE event = 0 SAMPLE {NON_EVENT_SAMPLE_RATIO}
+) WITH DATA PRIMARY INDEX (account_number);
+"""
+print("Creating sampled surv_modeling table...")
+DataFrame.from_query(create_modeling_sql)
+print("surv_modeling created.")
+
+# CELL 5: Pull sampled modeling table into Python (safe size)
+print("Pulling surv_modeling into pandas (sampled).")
+tdf = DataFrame.from_query("SELECT * FROM surv_modeling")
+pdf = to_pandas(tdf)
+print("Rows pulled:", len(pdf))
+pdf.head()
+
+# CELL 6: Prepare data and fit CoxPH in Python (lifelines)
+features = ['txn_7d','txn_30d','txn_90d','decline_rate_30d','sum_amt_90d']
+cols_required = ['account_number','duration_days','event'] + features
+df_model = pdf[cols_required].copy()
+
+# ensure numeric and handle NaNs
+for c in ['duration_days','event','txn_7d','txn_30d','txn_90d']:
+    df_model[c] = pd.to_numeric(df_model[c], errors='coerce').fillna(0).astype(int)
+for c in ['decline_rate_30d','sum_amt_90d']:
+    df_model[c] = pd.to_numeric(df_model[c], errors='coerce').fillna(0.0).astype(float)
+df_model['duration_days'] = df_model['duration_days'].clip(lower=1)
+
+# train / test split (stratify by event)
+train_df, test_df = train_test_split(df_model, test_size=0.2, random_state=42, stratify=df_model['event'])
+print("Train rows:", len(train_df), "Test rows:", len(test_df))
+
+# Fit CoxPH
+cph = CoxPHFitter(penalizer=0.01)
+cph.fit(train_df[['duration_days','event'] + features], duration_col='duration_days', event_col='event', show_progress=True)
+print("CoxPH fitted. Summary:")
+print(cph.summary)
+
+# CELL 7: Evaluate (concordance index)
+from lifelines.utils import concordance_index
+pred_partial_hazard = cph.predict_partial_hazard(test_df[features]).values.ravel()
+cindex = concordance_index(test_df['duration_days'], -pred_partial_hazard, test_df['event'])
+print("Test C-index:", cindex)
+
+# Optionally compute survival at horizon (30 days) for test set (for inspection)
+s30_df = cph.predict_survival_function(test_df[features], times=[30])
+# s30_df is DataFrame indexed by time; get row for time=30
+s30_vals = s30_df.loc[30].values
+test_df = test_df.reset_index(drop=True)
+test_df['s30'] = s30_vals
+test_df['fraud_risk_30'] = 1 - test_df['s30']
+print(test_df[['account_number','duration_days','event','fraud_risk_30']].head())
+
+# CELL 8: Export model coefficients and baseline survival to Teradata
+# Prepare coefficients table
+coefs = cph.params_.reset_index()
+coefs.columns = ['feature','beta']
+coefs['beta'] = coefs['beta'].astype(float)
+# baseline survival curve (days x s0)
+bs = cph.baseline_survival_.reset_index()
+# lifelines sometimes names column 'baseline survival' or similar
+bs.columns = ['time_day','s0'] if 'baseline survival' not in bs.columns else ['time_day','s0']
+bs['time_day'] = bs['time_day'].astype(int)
+bs['s0'] = bs.iloc[:,1].astype(float)
+
+# Write small tables back to Teradata
+print("Writing model_coeffs and baseline_surv to Teradata...")
+copy_to_sql(coefs, table_name='model_coeffs', if_exists='replace', index=False)
+copy_to_sql(bs[['time_day','s0']], table_name='baseline_surv', if_exists='replace', index=False)
+print("Model artifacts written to Teradata (model_coeffs, baseline_surv).")
+
+# CELL 9: Create account_lp and full batch scoring in Teradata (surv_score)
+# Build SQL that reads model_coeffs and baseline_surv in DB to compute lp and s30 for every account.
+# Note: model_coeffs is pivoted into columns (one-row) below.
+score_sql = """
+CREATE MULTISET TABLE account_lp AS
+SELECT s.account_number,
+       ( COALESCE(s.txn_7d,0)  * COALESCE(m.b_txn_7d,0)
+       + COALESCE(s.txn_30d,0) * COALESCE(m.b_txn_30d,0)
+       + COALESCE(s.txn_90d,0) * COALESCE(m.b_txn_90d,0)
+       + COALESCE(s.decline_rate_30d,0) * COALESCE(m.b_decline,0)
+       + COALESCE(s.sum_amt_90d,0) * COALESCE(m.b_sumamt,0)
+       ) AS lp
+FROM surv_account s
+LEFT JOIN
+(
+  SELECT
+    MAX(CASE WHEN feature = 'txn_7d' THEN beta END)   AS b_txn_7d,
+    MAX(CASE WHEN feature = 'txn_30d' THEN beta END)  AS b_txn_30d,
+    MAX(CASE WHEN feature = 'txn_90d' THEN beta END)  AS b_txn_90d,
+    MAX(CASE WHEN feature = 'decline_rate_30d' THEN beta END) AS b_decline,
+    MAX(CASE WHEN feature = 'sum_amt_90d' THEN beta END) AS b_sumamt
+  FROM model_coeffs
+) m ON 1=1
+;
+"""
+print("Creating account_lp in Teradata...")
+DataFrame.from_query(score_sql)
+print("account_lp created.")
+
+# Get baseline s0 for day=30 (exists because we exported bs earlier)
+try:
+    s0_30_df = to_pandas(DataFrame.from_query("SELECT s0 FROM baseline_surv WHERE time_day = 30"))
+    s0_30 = float(s0_30_df['s0'].iloc[0])
+    print("Baseline s0 at day 30:", s0_30)
+except Exception as e:
+    s0_30 = None
+    print("Warning: could not fetch baseline s0(30).", e)
+
+if s0_30 is not None:
+    surv_score_sql = f"""
+    CREATE MULTISET TABLE surv_score AS
+    SELECT l.account_number,
+           l.lp,
+           POWER({s0_30}, EXP(l.lp)) AS s30,
+           (1 - POWER({s0_30}, EXP(l.lp))) AS fraud_risk_30
+    FROM account_lp l
+    WITH DATA PRIMARY INDEX (account_number);
+    """
+    print("Creating surv_score (batch scoring) in Teradata...")
+    DataFrame.from_query(surv_score_sql)
+    print("surv_score created.")
+else:
+    print("Skipping surv_score creation since baseline_s0(30) missing.")
+
+# CELL 10: Create segments table (simple buckets)
+segment_sql = """
+CREATE MULTISET TABLE surv_segments AS
+SELECT account_number, fraud_risk_30,
+       CASE
+         WHEN fraud_risk_30 >= 0.70 THEN 'High'
+         WHEN fraud_risk_30 >= 0.40 THEN 'Medium'
+         ELSE 'Low'
+       END AS risk_segment
+FROM surv_score
+WITH DATA PRIMARY INDEX (account_number);
+"""
+print("Creating surv_segments...")
+DataFrame.from_query(segment_sql)
+print("surv_segments created.")
+
+# CELL 11: Pull a small summary of segments for inspection
+try:
+    seg_summary = to_pandas(DataFrame.from_query("SELECT risk_segment, COUNT(*) AS num_accounts, AVG(fraud_risk_30) AS avg_risk FROM surv_segments GROUP BY 1"))
+    print(seg_summary)
+except Exception as e:
+    print("Could not fetch segment summary:", e)
+
+# CELL 12: Save model locally (optional)
+with open('cph_model.pkl','wb') as f:
+    pickle.dump(cph, f)
+print("Local model saved: cph_model.pkl")
+
+# CELL 13: Cleanup (call when fully done)
+# remove_context()
+# print("Teradata context removed.")
