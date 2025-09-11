@@ -50,6 +50,7 @@ params AS (
          ) AS dataset_end
 ),
 
+-- union limited historical window to reduce scan
 unioned AS (
   SELECT account_number, CAST(txn_dt AS DATE) AS txn_dt, amount, decision, mcc, fraud_flag
   FROM trans_ct
@@ -64,6 +65,7 @@ unioned AS (
   WHERE CAST(txn_dt AS DATE) BETWEEN (SELECT snapshot_date FROM params) - {DAYS_BACK} AND (SELECT dataset_end FROM params)
 ),
 
+-- daily aggregation (account x day)
 daily_agg AS (
   SELECT account_number,
          txn_dt,
@@ -74,6 +76,7 @@ daily_agg AS (
   GROUP BY account_number, txn_dt
 ),
 
+-- per-account windowed features (7/30/90) from daily_agg
 aggr_account AS (
   SELECT
     d.account_number,
@@ -87,20 +90,40 @@ aggr_account AS (
   GROUP BY d.account_number
 ),
 
+-- first fraud date per account from transaction-level fraud_flag
 first_fraud AS (
   SELECT u.account_number,
          MIN(u.txn_dt) AS first_fraud_date
   FROM unioned u
   WHERE u.fraud_flag = 1
   GROUP BY u.account_number
+),
+
+-- last transaction date observed per account (within unioned window)
+last_txn AS (
+  SELECT u.account_number,
+         MAX(u.txn_dt) AS last_txn_date
+  FROM unioned u
+  GROUP BY u.account_number
 )
 
+-- Build surv_account with guarded logic:
 SELECT
   a.account_number,
   p.snapshot_date,
-  COALESCE(f.first_fraud_date, p.dataset_end) AS end_date,
-  CASE WHEN f.first_fraud_date IS NOT NULL THEN 1 ELSE 0 END AS event,
-  (COALESCE(f.first_fraud_date, p.dataset_end) - p.snapshot_date) AS duration_days,
+  -- choose end_date = first_fraud if first_fraud >= snapshot, else last_txn_date (censoring)
+  CASE
+    WHEN f.first_fraud_date IS NOT NULL AND f.first_fraud_date >= p.snapshot_date THEN f.first_fraud_date
+    ELSE l.last_txn_date
+  END AS end_date,
+  -- event only if fraud happens on/after snapshot
+  CASE WHEN f.first_fraud_date IS NOT NULL AND f.first_fraud_date >= p.snapshot_date THEN 1 ELSE 0 END AS event,
+  -- duration non-negative: either (first_fraud - snapshot) or (last_txn - snapshot)
+  ( CASE
+      WHEN f.first_fraud_date IS NOT NULL AND f.first_fraud_date >= p.snapshot_date
+        THEN (f.first_fraud_date - p.snapshot_date)
+      ELSE (l.last_txn_date - p.snapshot_date)
+    END ) AS duration_days,
   COALESCE(ag.txn_7d,0)   AS txn_7d,
   COALESCE(ag.txn_30d,0)  AS txn_30d,
   COALESCE(ag.txn_90d,0)  AS txn_90d,
@@ -110,6 +133,11 @@ FROM (SELECT DISTINCT account_number FROM daily_agg) a
 CROSS JOIN params p
 LEFT JOIN aggr_account ag ON a.account_number = ag.account_number
 LEFT JOIN first_fraud f ON a.account_number = f.account_number
+LEFT JOIN last_txn l ON a.account_number = l.account_number
+-- Keep only accounts that have activity or fraud on/after snapshot (otherwise no follow-up)
+WHERE
+  (l.last_txn_date IS NOT NULL AND l.last_txn_date >= p.snapshot_date)
+  OR (f.first_fraud_date IS NOT NULL AND f.first_fraud_date >= p.snapshot_date)
 ) WITH DATA PRIMARY INDEX (account_number);
 """
 
