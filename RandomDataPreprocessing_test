@@ -1,0 +1,97 @@
+# utils/data_preprocessing.py
+from typing import List, Tuple, Optional
+import pandas as pd
+import numpy as np
+
+def preprocess_data(
+    df: pd.DataFrame,
+    target_col: str,
+    categorical_custom_columns: Optional[List[str]] = None,
+    drop_columns_from_rules: Optional[List[str]] = None,
+    dropna_rows: bool = True,
+    missing_threshold: float = 0.30
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Prepare X, y for modeling.
+
+    Notes:
+      - Validates target_col.
+      - Drops columns explicitly requested in drop_columns_from_rules.
+      - Drops columns with missing fraction > missing_threshold.
+      - Optionally drops rows with any remaining NaN (dropna_rows). For interactive use,
+        consider imputation instead of dropping when many rows are missing.
+    """
+    if target_col not in df.columns:
+        raise ValueError(f"target_col '{target_col}' not found in dataframe columns")
+
+    data = df.copy()
+
+    # Mark explicit categorical columns
+    if categorical_custom_columns:
+        for c in categorical_custom_columns:
+            if c in data.columns:
+                data[c] = data[c].astype("category")
+
+    # Drop explicit columns (e.g., ids)
+    if drop_columns_from_rules:
+        data = data.drop(columns=drop_columns_from_rules, errors="ignore")
+
+    # Drop columns with too many missing values
+    cols_to_drop = [col for col in data.columns if data[col].isnull().mean() > missing_threshold]
+    if cols_to_drop:
+        data = data.drop(columns=cols_to_drop, errors="ignore")
+
+    # Optionally drop rows with any remaining missing values
+    if dropna_rows:
+        before = len(data)
+        data = data.dropna()
+        # if too many rows dropped, warn
+        after = len(data)
+        if after == 0:
+            raise ValueError("All rows dropped after dropna(); consider imputation or lowering threshold")
+
+    # Separate features and target
+    if target_col not in data.columns:
+        raise ValueError("After dropping, target_col no longer in data. Check drop columns and missing thresholds.")
+    y = data[target_col].copy()
+    X = data.drop(columns=[target_col])
+    return X, y
+
+
+# small helpers used by rulefit module (exposed)
+def _safe_category_code(series: pd.Series) -> np.ndarray:
+    s = series.astype("category")
+    return s.cat.codes.values
+
+# safe encoding helpers - paste into your data_preprocessing module
+
+import pandas as pd
+import numpy as np
+from typing import Any
+
+def _frequency_encode(series: pd.Series) -> np.ndarray:
+    """
+    Return frequency encoding as float32 array.
+    Works whether `series` is object or categorical (we coerce to object first).
+    """
+    # coerce to object/string so we can safely insert sentinel values
+    s = series.astype(object).fillna("__MISSING__")
+    freq = s.value_counts(normalize=True)
+    # map will produce NaN for unknowns but we filled above, so safe
+    mapped = s.map(freq).astype("float32")
+    return mapped.values
+
+def _topn_collapse(series: pd.Series, n: int = 20) -> np.ndarray:
+    """
+    Keep top-n frequent values and collapse others into '__OTHER__'.
+    Works for categorical input because we coerce to object first.
+    Returns integer codes (category codes for collapsed categories).
+    """
+    s = series.astype(object).fillna("__MISSING__")
+    top = pd.Series(s).value_counts().nlargest(n).index
+    # create a collapsed Series of plain python objects (not categorical yet)
+    collapsed = s.where(s.isin(top), other="__OTHER__")
+    # now convert to categorical (categories will include __OTHER__)
+    cat = pd.Categorical(collapsed)
+    return cat.codes.astype("int32")
+
