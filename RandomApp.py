@@ -19,23 +19,24 @@ data_option = st.sidebar.radio("Choose an option:", ("Upload CSV", "Generate Fak
 
 # ---------- helpers ----------
 def downcast_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Downcast numeric dtypes and convert low-cardinality objects to category to save memory."""
+    """Downcast numeric dtypes to save memory.
+    Do NOT convert object columns to category here, as later code expects plain objects
+    (encoding helpers will convert to categorical safely when needed).
+    """
     df = df.copy()
     for col in df.select_dtypes(include=["int64", "float64"]).columns:
         try:
+            # downcast integers and floats safely
             if pd.api.types.is_integer_dtype(df[col].dropna()):
                 df[col] = pd.to_numeric(df[col], downcast="signed")
             else:
                 df[col] = pd.to_numeric(df[col], downcast="float")
         except Exception:
-            # if conversion fails, leave as-is
             continue
-    for col in df.select_dtypes(include=["object"]).columns:
-        try:
-            if df[col].nunique(dropna=False) / max(1, len(df)) < 0.5:
-                df[col] = df[col].astype("category")
-        except Exception:
-            continue
+
+    # Do NOT convert object columns to category here (may break later encoding)
+    # If you really want to convert, do so later in preprocessing with safe fill/add-categories logic.
+
     return df
 
 def clear_uploaded_dataframe():
