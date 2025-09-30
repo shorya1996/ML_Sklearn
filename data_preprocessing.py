@@ -9,12 +9,16 @@ def preprocess_data(
     categorical_custom_columns: Optional[List[str]] = None,
     drop_columns_from_rules: Optional[List[str]] = None,
     dropna_rows: bool = True,
-    missing_threshold: float = 0.30
+    missing_threshold: float = 0.30,
+    auto_categorical_threshold: int = 3
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Prepare X (DataFrame) and y (Series) for modeling.
+
+    Features:
     - Validates target_col exists.
-    - Optionally marks given columns as categorical.
+    - Auto-converts columns with < auto_categorical_threshold distinct values (default <3) into categorical safely.
+    - Optionally marks additional user-specified columns as categorical.
     - Drops user-specified columns and columns with > missing_threshold fraction missing.
     - Optionally drops rows with any remaining NaN (dropna_rows).
     """
@@ -23,18 +27,32 @@ def preprocess_data(
 
     data = df.copy()
 
+    # --- Auto-convert low-distinct-count columns to categorical safely ---
+    for col in data.columns:
+        if col == target_col:
+            continue
+        nunique = data[col].nunique(dropna=False)
+        if nunique < auto_categorical_threshold:
+            s = data[col].astype(object).fillna("__MISSING__")
+            data[col] = pd.Categorical(s)
+
+    # --- Explicit categorical columns from user ---
     if categorical_custom_columns:
         for c in categorical_custom_columns:
             if c in data.columns:
-                data[c] = data[c].astype("category")
+                s = data[c].astype(object).fillna("__MISSING__")
+                data[c] = pd.Categorical(s)
 
+    # --- Drop unwanted columns ---
     if drop_columns_from_rules:
         data = data.drop(columns=drop_columns_from_rules, errors="ignore")
 
+    # --- Drop columns with too many NaN ---
     cols_to_drop = [col for col in data.columns if data[col].isnull().mean() > missing_threshold]
     if cols_to_drop:
         data = data.drop(columns=cols_to_drop, errors="ignore")
 
+    # --- Drop rows if requested ---
     if dropna_rows:
         before = len(data)
         data = data.dropna()
@@ -50,7 +68,7 @@ def preprocess_data(
     return X, y
 
 
-# --- Safe encoding helpers (coerce to object before adding sentinel values) ---
+# --- Safe encoding helpers ---
 def safe_frequency_encode(series: pd.Series) -> np.ndarray:
     s = series.astype(object).fillna("__MISSING__")
     freq = s.value_counts(normalize=True)
